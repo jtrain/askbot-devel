@@ -53,7 +53,7 @@ from urlparse import urlparse
 from openid.consumer.consumer import Consumer, \
     SUCCESS, CANCEL, FAILURE, SETUP_NEEDED
 from openid.consumer.discover import DiscoveryFailure
-from openid.extensions import sreg
+from openid.extensions import sreg, ax
 # needed for some linux distributions like debian
 try:
     from openid.yadis import xri
@@ -428,7 +428,14 @@ def signin(request):
 
                 #todo: make a simple-use wrapper for openid protocol
 
-                sreg_req = sreg.SRegRequest(optional=['nickname', 'email'])
+                if provider_name.lower() == "google":
+                    sreg_req = ax.FetchRequest()
+                    sreg_req.add(ax.AttrInfo(
+                               'http://schema.openid.net/contact/email',
+                                alias='email', required=True))
+                else:
+                    sreg_req = sreg.SRegRequest(optional=['nickname', 'email'])
+                    
                 redirect_to = "%s%s?%s" % (
                         get_url_host(request),
                         reverse('user_complete_signin'), 
@@ -749,7 +756,22 @@ def signin_success(request, identity_url, openid_response):
     next_url = get_next_url(request)
     provider_name = util.get_provider_name(openid_url)
 
-    request.session['email'] = openid_data.sreg.get('email', '')
+    request.session['email'] = email = openid_data.sreg.get('email', 
+                                     request.GET.get('openid.ext1.value.email', ''))
+
+    # fancy work to get the user object.
+    if not user and request.GET.get("openid.ext1.value.email"):
+        try:
+            assoc = UserAssociation.objects.get(user__email=email, provider_name=provider_name)
+        except UserAssociation.DoesNotExist:
+            pass
+        else:
+            assoc.openid_url = openid_url
+            assoc.save()
+            user = authenticate(
+                    openid_url=openid_url,
+                    method="openid")
+
     request.session['username'] = openid_data.sreg.get('nickname', '')
 
     return finalize_generic_signin(
