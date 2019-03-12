@@ -50,6 +50,9 @@ except ImportError:
 
 from askbot.deps.django_authopenid import util
 
+from simplemathcaptcha.fields import MathCaptchaField
+
+
 class ConsentField(forms.BooleanField):
     def __init__(self, *args, **kwargs):
         super(ConsentField, self).__init__(*args, **kwargs)
@@ -297,6 +300,7 @@ class RegistrationForm(forms.Form):
     """ openid signin form """
     next = NextUrlField()
     username = UserNameField(widget_attrs={'tabindex': 0})
+    real = MathCaptchaField()
 
     def __init__(self, *args, **kwargs):
         self.request = kwargs.pop('request', None)
