@@ -1,10 +1,13 @@
 """a module for patching django"""
 import imp
+import hashlib
 import os
 import sys
+import types
 from django.utils.safestring import mark_safe
 from django.utils.functional import lazy
 from django.template import Node
+
 try:
     from functools import WRAPPER_ASSIGNMENTS
 except ImportError:
@@ -121,7 +124,6 @@ import re
 import random
 from django.conf import settings
 from django.core.urlresolvers import get_callable
-from django.utils.hashcompat import md5_constructor
 from django.utils.safestring import mark_safe
 _POST_FORM_RE = \
     re.compile(r'(<form\W[^>]*\bmethod\s*=\s*(\'|"|)POST(\'|"|)\b[^>]*>)', re.IGNORECASE)
@@ -139,11 +141,11 @@ def _get_failure_view():
     return get_callable(settings.CSRF_FAILURE_VIEW)
 
 def _get_new_csrf_key():
-    return md5_constructor("%s%s"
+    return hashlib.md5("%s%s"
                 % (randrange(0, _MAX_CSRF_KEY), settings.SECRET_KEY)).hexdigest()
 
 def _make_legacy_session_token(session_id):
-    return md5_constructor(settings.SECRET_KEY + session_id).hexdigest()
+    return hashlib.md5(settings.SECRET_KEY + session_id).hexdigest()
 
 class CsrfViewMiddleware(object):
     """
@@ -292,7 +294,7 @@ def add_import_library_function():
         app_module = import_module(app_path)
         try:
             mod = import_module(taglib_module)
-        except ImportError, e:
+        except ImportError as e:
             # If the ImportError is because the taglib submodule does not exist, that's not
             # an error that should be raised. If the submodule exists and raised an ImportError
             # on the attempt to load it, that we want to raise.
@@ -327,7 +329,7 @@ def add_csrf_protection():
 
     #add csrf_protect decorator
     import django.views.decorators
-    django.views.decorators.csrf = imp.new_module('csrf') 
+    django.views.decorators.csrf = imp.new_module('csrf')
     django.views.decorators.csrf.csrf_protect = csrf_protect
 
 def add_available_attrs_decorator():
@@ -339,3 +341,81 @@ def add_available_attrs_decorator():
         return tuple(a for a in WRAPPER_ASSIGNMENTS if hasattr(fn, a))
     import django.utils.decorators
     django.utils.decorators.available_attrs = available_attrs
+
+def add_render_shortcut():
+    """adds `render` shortcut, introduced with django 1.3"""
+    try:
+        from django.shortcuts import render
+    except ImportError:
+        def render(request, template, data=None):
+            from django.shortcuts import render_to_response
+            from django.template import RequestContext
+            return render_to_response(template, RequestContext(request, data))
+
+        import django.shortcuts
+        django.shortcuts.render = render
+
+
+def add_hashcompat():
+    """adds hashcompat module where removed
+    todo: remove dependency on Coffin and then remove
+    this hack"""
+    import django.utils
+    hashcompat = types.ModuleType('hashcompat')
+    hashcompat.md5_constructor = hashlib.md5
+    sys.modules['django.utils.hashcompat'] = hashcompat
+
+
+def add_simplejson():
+    """adds back simplejson - which may be used
+    by the dependency libraries"""
+    import django.utils
+    import simplejson
+    django.utils.simplejson = simplejson
+    sys.modules['django.utils.simplejson'] = simplejson
+
+
+from django.utils import six
+from django.utils.functional import Promise
+import django.utils.html
+
+def fix_lazy_double_escape():
+    """
+    Wrap django.utils.html.escape to fix the double escape issue visible at
+    least with field labels with localization
+    """
+    django.utils.html.escape = wrap_escape(django.utils.html.escape)
+
+
+def wrap_escape(func):
+    """
+    Decorator adapted from https://github.com/django/django/pull/1007
+    """
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        for arg in list(args) + list(six.itervalues(kwargs)):
+            if isinstance(arg, Promise):
+                break
+        else:
+            return func(*args, **kwargs)
+        return lazy(func, six.text_type)(*args, **kwargs)
+    @wraps(wrapper)
+    def wrapped(*args, **kwargs):
+        return mark_safe(func(*args, **kwargs))
+    return wrapped
+
+
+def patch_django_template():
+    import django.template
+    django.template.add_to_builtins = django.template.base.add_to_builtins
+    django.template.builtins = django.template.base.builtins
+    django.template.get_library = django.template.base.get_library
+    django.template.import_library = django.template.base.import_library
+    django.template.Origin = django.template.base.Origin
+    django.template.InvalidTemplateLibrary = django.template.base.InvalidTemplateLibrary
+
+    from django.template.loaders import app_directories
+    app_directories.app_template_dirs = list() #dummy value
+    # from django.template.utils import get_app_template_dirs
+    # later must be set to get_app_template_dirs('templates')
+

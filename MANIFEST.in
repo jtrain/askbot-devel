@@ -26,8 +26,11 @@ exclude askbot/upfiles/avatars/*
 recursive-exclude askbot/doc/build/*
 recursive-exclude avatar *
 recursive-exclude adzone *
+recursive-exclude custom_settings *
+recursive-exclude custom *
 recursive-exclude follow *
 recursive-exclude categories *
 recursive-exclude follow *
 recursive-exclude env *
 recursive-exclude .tox
+recursive-exclude testproject

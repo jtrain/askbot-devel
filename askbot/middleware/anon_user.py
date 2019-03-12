@@ -19,7 +19,7 @@ class AnonymousMessageManager(object):
 
     def create(self, message=''):
         """send message to anonymous user"""
-        create_message(self.request, message)  
+        create_message(self.request, message)
 
     def get_and_delete(self):
         """returns messages sent to the anonymous user
@@ -32,6 +32,14 @@ def dummy_deepcopy(*arg):
     that now contains reference to request, which cannot be deepcopied
     """
     return None
+
+
+def connect_messages_to_anon_user(request):
+    request.user.__deepcopy__ = dummy_deepcopy
+    request.user.message_set = AnonymousMessageManager(request)
+    request.user.get_and_delete_messages = \
+                    request.user.message_set.get_and_delete
+
 
 class ConnectToSessionMessagesMiddleware(object):
     """Middleware that attaches messages to anonymous users, and
@@ -50,11 +58,7 @@ class ConnectToSessionMessagesMiddleware(object):
         if request.user.is_anonymous():
             #1) Attach the ability to receive messages
             #plug on deepcopy which may be called by django db "driver"
-            request.user.__deepcopy__ = dummy_deepcopy
-            #here request is linked to anon user
-            request.user.message_set = AnonymousMessageManager(request)
-            request.user.get_and_delete_messages = \
-                            request.user.message_set.get_and_delete
+            connect_messages_to_anon_user(request)
 
             #2) set the first greeting one time per session only
             if 'greeting_set' not in request.session and \

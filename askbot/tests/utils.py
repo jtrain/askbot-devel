@@ -1,17 +1,55 @@
 """utility functions used by Askbot test cases
 """
-from django.test import TestCase
 from functools import wraps
+from markdown2 import Markdown
+from django.apps import apps
+from django.contrib.auth.management import create_permissions
+from django.contrib.sites.management import create_default_site
+from django.contrib.contenttypes.management import update_contenttypes
+from django.core.cache import cache
+from django.db.models.signals import post_migrate
+from django.test import TestCase
 from askbot import models
+from askbot import signals
 
-def create_user(
-            username = None, 
-            email = None, 
-            notification_schedule = None,
-            date_joined = None,
-            status = 'a',
-            reputation = 1
-        ):
+def with_settings(**settings_dict):
+    """a decorator that will run function with settings
+    then apply previous settings and return the result
+    of the function.
+    If the function raises an exception - decorator
+    still restores the previous settings
+    """
+
+    def decorator(func):
+
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            from askbot.conf import settings as askbot_settings
+            backup_settings_dict = dict()
+            for key, value in settings_dict.items():
+                backup_settings_dict[key] = getattr(askbot_settings, key)
+                askbot_settings.update(key, value)
+
+            try:
+                return func(*args, **kwargs)
+            except:
+                raise
+            finally:
+                for key, value in backup_settings_dict.items():
+                    askbot_settings.update(key, value)
+
+        return wrapped
+
+    return decorator
+
+
+
+def create_user(username=None,
+                email=None,
+                notification_schedule=None,
+                date_joined=None,
+                status=None,
+                reputation=1):
     """Creates a user and sets default update subscription
     settings
 
@@ -25,13 +63,13 @@ def create_user(
     * 'q_sel' - questions that user decides to follow
     * 'm_and_c' - comments and mentions of user anywhere
 
-    and values as keys in 
+    and values as keys in
     :attr:`~askbot.models.EmailFeedSetting.FEED_TYPES`:
 
     * 'i' - instantly
     * 'd' - daily
     * 'w' - weekly
-    * 'n' - never 
+    * 'n' - never
     """
     user = models.User.objects.create_user(username, email)
 
@@ -39,10 +77,9 @@ def create_user(
     if date_joined is not None:
         user.date_joined = date_joined
         user.save()
-    user.set_status(status)
     if notification_schedule == None:
         notification_schedule = models.EmailFeedSetting.NO_EMAIL_SCHEDULE
-        
+
     #a hack, we need to delete these, that will be created automatically
     #because just below we will be replacing them with the new values
     user.notification_subscriptions.all().delete()
@@ -54,6 +91,11 @@ def create_user(
                         subscriber = user
                     )
         feed.save()
+
+    signals.user_registered.send(None, user=user)
+    if status:
+        user.set_status(status)
+
     return user
 
 
@@ -62,13 +104,38 @@ class AskbotTestCase(TestCase):
     to django TestCase class
     """
 
+    def _fixture_setup(self):
+        super(AskbotTestCase, self)._fixture_setup()
+        for app_config in apps.get_app_configs():
+            update_contenttypes(app_config)
+            create_permissions(app_config)
+            create_default_site(app_config)
+
+    def _fixture_teardown(self):
+        post_migrate.disconnect(create_default_site, sender=apps.get_app_config('sites'))
+        post_migrate.disconnect(update_contenttypes)
+        post_migrate.disconnect(create_permissions, dispatch_uid="django.contrib.auth.management.create_permissions")
+
+        super(AskbotTestCase, self)._fixture_teardown()
+
+        post_migrate.connect(update_contenttypes)
+        post_migrate.connect(create_permissions, dispatch_uid="django.contrib.auth.management.create_permissions")
+        post_migrate.connect(create_default_site, sender=apps.get_app_config('sites'))
+
+
+    @classmethod
+    def setUpClass(cls):
+        cache.clear()
+        super(AskbotTestCase, cls).setUpClass()
+
     def create_user(
                 self,
-                username = 'user',
-                email = None,
-                notification_schedule = None,
-                date_joined = None,
-                status = 'a'
+                username='user',
+                email=None,
+                notification_schedule=None,
+                date_joined=None,
+                reputation=1,
+                status=None
             ):
         """creates user with username, etc and
         makes the result accessible as
@@ -84,15 +151,15 @@ class AskbotTestCase(TestCase):
             email = username + '@example.com'
 
         user_object = create_user(
-                    username = username,
-                    email = email,
-                    notification_schedule = notification_schedule,
-                    date_joined = date_joined,
-                    status = status
+                    username=username,
+                    email=email,
+                    notification_schedule=notification_schedule,
+                    date_joined=date_joined,
+                    status=status,
+                    reputation=reputation
                 )
 
         setattr(self, username, user_object)
-
         return user_object
 
     def assertRaisesRegexp(self, *args, **kwargs):
@@ -108,18 +175,27 @@ class AskbotTestCase(TestCase):
             args_list.pop(1)#so we can remove an item
             self.assertRaises(*args_list, **kwargs)
 
+    def assertQuerysetEqual(self, qs1, qs2, transform=repr, ordered=True):
+        '''borrowed from django1.4 and modified a bit'''
+        items = map(transform, qs1)
+        values = map(transform, qs2)
+        if not ordered:
+            return self.assertEqual(set(items), set(values))
+        return self.assertEqual(list(items), list(values))
 
     def post_question(
-                    self, 
-                    user = None,
-                    title = 'test question title',
-                    body_text = 'test question body text',
-                    tags = 'test',
-                    by_email = False,
-                    wiki = False,
-                    is_anonymous = False,
-                    follow = False,
-                    timestamp = None,
+                    self,
+                    user=None,
+                    title='test question title',
+                    body_text='test question body text',
+                    tags='test',
+                    by_email=False,
+                    wiki=False,
+                    is_anonymous=False,
+                    is_private=False,
+                    group_id=None,
+                    follow=False,
+                    timestamp=None,
                 ):
         """posts and returns question on behalf
         of user. If user is not given, it will be self.user
@@ -133,13 +209,15 @@ class AskbotTestCase(TestCase):
             user = self.user
 
         question = user.post_question(
-                            title = title,
-                            body_text = body_text,
-                            tags = tags,
-                            by_email = by_email,
-                            wiki = wiki,
-                            is_anonymous = is_anonymous,
-                            timestamp = timestamp
+                            title=title,
+                            body_text=body_text,
+                            tags=tags,
+                            by_email=by_email,
+                            wiki=wiki,
+                            is_anonymous=is_anonymous,
+                            is_private=is_private,
+                            group_id=group_id,
+                            timestamp=timestamp
                         )
 
         if follow:
@@ -147,11 +225,64 @@ class AskbotTestCase(TestCase):
 
         return question
 
+    def edit_question(self,
+                user=None,
+                question=None,
+                title='edited title',
+                body_text='edited body text',
+                revision_comment='edited the question',
+                tags='one two three four',
+                wiki=False,
+                edit_anonymously=False,
+                is_private=False,
+                timestamp=None,
+                force=False,#if True - bypass the assert
+                by_email=False
+            ):
+        """helper editing the question,
+        a bunch of fields are pre-filled for the ease of use
+        """
+        user.edit_question(
+            question=question,
+            title=title,
+            body_text=body_text,
+            revision_comment=revision_comment,
+            tags=tags,
+            wiki=wiki,
+            edit_anonymously=edit_anonymously,
+            is_private=is_private,
+            timestamp=timestamp,
+            force=False,#if True - bypass the assert
+            by_email=False
+        )
+
+    def edit_answer(self,
+            user=None,
+            answer=None,
+            body_text='edited answer body',
+            revision_comment='editing answer',
+            wiki=False,
+            is_private=False,
+            timestamp=None,
+            force=False,#if True - bypass the assert
+            by_email=False
+        ):
+        user.edit_answer(
+            answer=answer,
+            body_text=body_text,
+            revision_comment=revision_comment,
+            wiki=wiki,
+            is_private=is_private,
+            timestamp=timestamp,
+            force=force,
+            by_email=by_email
+        )
+
     def reload_object(self, obj):
         """reloads model object from the database
         """
         return obj.__class__.objects.get(id = obj.id)
-        
+
     def post_answer(
                     self,
                     user = None,
@@ -160,6 +291,7 @@ class AskbotTestCase(TestCase):
                     by_email = False,
                     follow = False,
                     wiki = False,
+                    is_private = False,
                     timestamp = None
                 ):
 
@@ -171,6 +303,7 @@ class AskbotTestCase(TestCase):
                         by_email = by_email,
                         follow = follow,
                         wiki = wiki,
+                        is_private = is_private,
                         timestamp = timestamp
                     )
 
@@ -182,9 +315,14 @@ class AskbotTestCase(TestCase):
             except models.User.DoesNotExist:
                 user = self.create_user('tag_creator')
 
-        tag = models.Tag(created_by = user, name = tag_name)
+        tag = models.Tag(created_by=user, name=tag_name, language_code='en')
         tag.save()
         return tag
+
+    def create_group(self, group_name=None, openness=models.Group.OPEN):
+        return models.Group.objects.get_or_create(
+                    name='private', openness=openness
+                )
 
     def post_comment(
                 self,
@@ -194,8 +332,8 @@ class AskbotTestCase(TestCase):
                 by_email = False,
                 timestamp = None
             ):
-        """posts and returns a comment to parent post, uses 
-        now timestamp if not given, dummy body_text 
+        """posts and returns a comment to parent post, uses
+        now timestamp if not given, dummy body_text
         author is required
         """
         if user is None:

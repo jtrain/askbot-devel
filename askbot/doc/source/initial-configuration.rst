@@ -13,7 +13,7 @@ Installing Askbot as a new Django project (standalone app)
 .. note::
     Firstly - if you are preparing the project directory manually,
     make sure that the directory name does not
-    have the `.` - dot - symbol, because it is illegal for Python modules. 
+    have the `.` - dot - symbol, because it is illegal for Python modules.
     For example::
 
         mkdir mydjangosite
@@ -27,6 +27,14 @@ and answering the questions. The `askbot-setup` script will ask you where to dep
 the directory where the Askbot project resides, you can answer `.` (`.` refers to the current directory).
 There may be an error message; ignore it.
 
+After that - run command `collectstatic` - in order to place all the static files (.css and .js)
+into one directory::
+
+    python manage.py collectstatic
+
+Remember to repeat this command any time you upgrade Askbot or other apps installed
+in the same project.
+
 .. note::
 
     All Django sites have four project-wide files::
@@ -39,7 +47,7 @@ There may be an error message; ignore it.
     `askbot-setup` adds those files to the directory you select (and some more things specific to Askbot).
 
 .. versionadded:: 0.7.24
-    `askbot-setup` also have command line arguments such as folder name(name), database name, database password and database user also added verbosity support. 
+    `askbot-setup` also have command line arguments such as folder name(name), database name, database password and database user also added verbosity support.
     You can also specify a local settings file to append it's contents to the deployment settings file.
 
     +----------------------------------+------------------------------------------------------------+
@@ -48,13 +56,17 @@ There may be an error message; ignore it.
     | -n <NAME>                        | Name of the instance, this is the name that the            |
     |                                  | folder will use.                                           |
     +----------------------------------+------------------------------------------------------------+
+    | -e <DATABASE_ENGINE>             | Integer values: 1 - postgresql, 2 - sqlite3, 3 - mysql     |
+    +----------------------------------+------------------------------------------------------------+
     | -d <DATABASE_NAME>               | The database name that the instance will use.              |
     +----------------------------------+------------------------------------------------------------+
     | -u <DATABASE_USER>               | The database user that the instance will use.              |
     +----------------------------------+------------------------------------------------------------+
     | -p <DATABASE_PASSWORD>           | The database password for the user.                        |
     +----------------------------------+------------------------------------------------------------+
-    | --domain=<DOMAIN_NAME>           | Domain name for the application.                           |
+    | --db-host <DATABASE_HOST>        | The database host to which askbot will connect             |
+    +----------------------------------+------------------------------------------------------------+
+    | --db-port <DATABASE_PORT>        | The database port to which askbot will connect.            |
     +----------------------------------+------------------------------------------------------------+
     | --append-settings=<SETTINGS_FILE>| Allows to append a setting file content to the             |
     |                                  | settings file, the parameter is the file to use.           |
@@ -79,8 +91,8 @@ All values must be enclosed in single quotes, as shown below::
 
 .. note::
 
-    The files settings.py_ and urls.py_ may also need to be touched up 
-    when you upgrate the software, because new versions may bring 
+    The files settings.py_ and urls.py_ may also need to be touched up
+    when you upgrate the software, because new versions may bring
     new dependencies and add new site urls.
 
 

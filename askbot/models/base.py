@@ -1,10 +1,12 @@
-import datetime
 from django.db import models
 from django.contrib.auth.models import User
+from django.utils import timezone
+from django.utils.html import strip_tags
+from askbot.conf import settings as askbot_settings
+from askbot.utils.markup import convert_text
 
 class BaseQuerySetManager(models.Manager):
-    """a base class that allows chainable qustom filters
-    on the query sets
+    """Base class for chainable custom filters on the query sets.
 
     pattern from http://djangosnippets.org/snippets/562/
 
@@ -20,7 +22,7 @@ class BaseQuerySetManager(models.Manager):
     >>>    #add more custom filters here
     >>>
     >>>class SomeManager(askbot.models.base.BaseQuerySetManager)
-    >>>    def get_query_set(self):
+    >>>    def get_queryset(self):
     >>>        return SomeQuerySet(self.model)
     >>>
     >>>class SomeModel(django.db.models.Model)
@@ -38,19 +40,38 @@ class BaseQuerySetManager(models.Manager):
         try:
             return getattr(self.__class__, attr, *args)
         except AttributeError:
-            return getattr(self.get_query_set(), attr, *args)
+            return getattr(self.get_queryset(), attr, *args)
 
 
-class DraftContent(models.Model):
+class AnonymousContent(models.Model):
     """Base class for AnonymousQuestion and AnonymousAnswer"""
     session_key = models.CharField(max_length=40)  #session id for anonymous questions
     wiki = models.BooleanField(default=False)
-    added_at = models.DateTimeField(default=datetime.datetime.now)
-    ip_addr = models.IPAddressField(max_length=21) #allow high port numbers
+    added_at = models.DateTimeField(default=timezone.now)
+    ip_addr = models.GenericIPAddressField(max_length=45) #allow high port numbers
     author = models.ForeignKey(User,null=True)
     text = models.TextField()
-    summary = models.CharField(max_length=180)
 
     class Meta:
         abstract = True
         app_label = 'askbot'
+
+class DraftContent(models.Model):
+    """Base for autosaved DraftQuestion and DraftAnswer"""
+    text = models.TextField(null=True)
+
+    class Meta:
+        abstract = True
+        app_label = 'askbot'
+
+    def get_text(self):
+        # Todo: test convert the text and if 
+        # resulting html has no content - clear the text
+        # this will strip bogus content that might be created
+        # by the rich text editors and remove the flashing
+        # bogus html upon loading of the editors.
+        test_html = convert_text(self.text)
+        test_text = strip_tags(test_html).strip()
+        if test_text == '':
+            return ''
+        return self.text

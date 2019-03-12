@@ -1,11 +1,12 @@
+from askbot.deps.livesettings.compat import get_cache_timeout
+from askbot.deps.livesettings.overrides import get_overrides
 from django.conf import settings
 from django.contrib.sites.models import Site
 from django.db import models
 from django.db.models import loading
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import ugettext_lazy
 from keyedcache import cache_key, cache_get, cache_set, NotCachedError
 from keyedcache.models import CachedObjectMixin
-from askbot.deps.livesettings.overrides import get_overrides
 import logging
 
 log = logging.getLogger('configuration.models')
@@ -41,8 +42,7 @@ def find_setting(group, key, site=None):
     elif use_db:
         try:
             setting = cache_get(ck)
-
-        except NotCachedError, nce:
+        except NotCachedError as nce:
             if loading.app_cache_ready():
                 try:
                     setting = Setting.objects.get(site__id__exact=siteid, key__exact=key, group__exact=group)
@@ -76,8 +76,8 @@ class SettingNotSet(Exception):
         self.args = [self.key, self.cachekey]
 
 class SettingManager(models.Manager):
-    def get_query_set(self):
-        all = super(SettingManager, self).get_query_set()
+    def get_queryset(self):
+        all = super(SettingManager, self).get_queryset()
         siteid = _safe_get_siteid(None)
         return all.filter(site__id__exact=siteid)
 
@@ -104,7 +104,7 @@ class ImmutableSetting(object):
 
 
 class Setting(models.Model, CachedObjectMixin):
-    site = models.ForeignKey(Site, verbose_name=_('Site'))
+    site = models.ForeignKey(Site, verbose_name=ugettext_lazy('Site'))
     group = models.CharField(max_length=100, blank=False, null=False)
     key = models.CharField(max_length=100, blank=False, null=False)
     value = models.CharField(max_length=255, blank=True)
@@ -134,23 +134,23 @@ class Setting(models.Model, CachedObjectMixin):
     def cache_set(self, *args, **kwargs):
         val = kwargs.pop('value', self)
         key = self.cache_key(*args, **kwargs)
-        #TODO: fix this with Django's > 1.3 CACHE dict setting support
-        length = getattr(settings, 'LIVESETTINGS_CACHE_TIMEOUT', settings.CACHE_TIMEOUT)
+        length = get_cache_timeout()
         cache_set(key, value=val, length=length)
 
     class Meta:
         unique_together = ('site', 'group', 'key')
+        app_label = 'livesettings'
 
 
 class LongSettingManager(models.Manager):
-    def get_query_set(self):
-        all = super(LongSettingManager, self).get_query_set()
+    def getquery_set(self):
+        all = super(LongSettingManager, self).get_queryset()
         siteid = _safe_get_siteid(None)
         return all.filter(site__id__exact=siteid)
 
 class LongSetting(models.Model, CachedObjectMixin):
     """A Setting which can handle more than 255 characters"""
-    site = models.ForeignKey(Site, verbose_name=_('Site'))
+    site = models.ForeignKey(Site, verbose_name=ugettext_lazy('Site'))
     group = models.CharField(max_length=100, blank=False, null=False)
     key = models.CharField(max_length=100, blank=False, null=False)
     value = models.TextField(blank=True)
@@ -181,10 +181,9 @@ class LongSetting(models.Model, CachedObjectMixin):
     def cache_set(self, *args, **kwargs):
         val = kwargs.pop('value', self)
         key = self.cache_key(*args, **kwargs)
-        #TODO: fix this with Django's > 1.3 CACHE dict setting support
-        length = getattr(settings, 'LIVESETTINGS_CACHE_TIMEOUT', settings.CACHE_TIMEOUT)
+        length = get_cache_timeout()
         cache_set(key, value=val, length=length)
 
     class Meta:
         unique_together = ('site', 'group', 'key')
-
+        app_label = 'livesettings'

@@ -1,197 +1,359 @@
 from askbot import startup_procedures
 startup_procedures.run()
 
+from django.contrib.auth.models import User
+
+import askbot
 import collections
 import datetime
 import hashlib
 import logging
+import os
+import re
 import urllib
+from functools import partial
+import uuid
+from celery import states
+from celery.task import task
 from django.core.urlresolvers import reverse, NoReverseMatch
+from django.core.paginator import Paginator
+from django.db import IntegrityError
 from django.db.models import signals as django_signals
 from django.template import Context
+from django.template.loader import get_template
+from django.utils import timezone
+from django.utils import translation
 from django.utils.translation import ugettext as _
-from django.utils.translation import ungettext
-from django.contrib.auth.models import User
+from django.utils.translation import string_concat, override, ungettext
 from django.utils.safestring import mark_safe
 from django.utils.html import escape
 from django.db import models
+from django.db.models import Count, Q
 from django.conf import settings as django_settings
 from django.contrib.contenttypes.models import ContentType
-from django.core import cache
+from django.core.cache import cache
 from django.core import exceptions as django_exceptions
 from django_countries.fields import CountryField
 from askbot import exceptions as askbot_exceptions
 from askbot import const
-from askbot.const.message_keys import get_i18n_message
+from askbot.const import message_keys
 from askbot.conf import settings as askbot_settings
 from askbot.models.question import Thread
 from askbot.skins import utils as skin_utils
+from askbot.mail.messages import (WelcomeEmail,
+                                  WelcomeEmailRespondable,
+                                  AccountManagementRequest)
 from askbot.models.question import QuestionView, AnonymousQuestion
+from askbot.models.question import DraftQuestion
 from askbot.models.question import FavoriteQuestion
-from askbot.models.tag import Tag, MarkedTag
+from askbot.models.message import Message
+from askbot.models.tag import Tag, MarkedTag, TagSynonym
+from askbot.models.tag import format_personal_group_name
 from askbot.models.user import EmailFeedSetting, ActivityAuditStatus, Activity
-from askbot.models.user import GroupMembership, GroupProfile
-from askbot.models.post import Post, PostRevision, PostFlagReason, AnonymousAnswer
+from askbot.models.user import GroupMembership
+from askbot.models.user import Group
+from askbot.models.user import BulkTagSubscription
+from askbot.models.post import Post, PostRevision
+from askbot.models.post import PostFlagReason, AnonymousAnswer
+from askbot.models.post import PostToGroup
+from askbot.models.post import DraftAnswer
+from askbot.models.user_profile import (
+                                add_profile_properties,
+                                UserProfile,
+                                LocalizedUserProfile,
+                                get_localized_profile_cache_key
+                            )
 from askbot.models.reply_by_email import ReplyAddress
-from askbot.models import signals
-from askbot.models.badges import award_badges_signal, get_badge, BadgeData
-from askbot.models.repute import Award, Repute, Vote
+from askbot.models.badges import award_badges_signal, get_badge
+from askbot.models.repute import Award, Repute, Vote, BadgeData
+from askbot.models.widgets import AskWidget, QuestionWidget
+from askbot.models.meta import ImportRun, ImportedObjectInfo
+from askbot.models.role import Role, get_role_set
 from askbot import auth
+from askbot.utils.functions import generate_random_key
 from askbot.utils.decorators import auto_now_timestamp
-from askbot.utils.slug import slugify
-from askbot.utils.html import sanitize_html
-from askbot.utils.diff import textDiff as htmldiff
+from askbot.utils.decorators import reject_forbidden_phrases
+from askbot.utils.markup import URL_RE
+from askbot.utils.slug import slugify, ascii_slugify
+from askbot.utils.transaction import defer_celery_task
+from askbot.utils.translation import get_language
+from askbot.utils.html import replace_links_with_text
+from askbot.utils.html import site_url
+from askbot.utils.db import table_exists
 from askbot.utils.url_utils import strip_path
+from askbot.utils import functions
 from askbot import mail
+from askbot import signals
+from jsonfield import JSONField
+
+register_user_signal = partial(signals.register_generic_signal, sender=User)
+
 
 def get_model(model_name):
     """a shortcut for getting model for an askbot app"""
     return models.get_model('askbot', model_name)
 
-def get_admins_and_moderators():
-    """returns query set of users who are site administrators
-    and moderators"""
-    return User.objects.filter(
-        models.Q(is_superuser=True) | models.Q(status='m')
-    )
+def get_admin():
+    """returns admin with the lowest user ID
+    if there are no users at all - creates one
+    with name "admin" and unusable password
+    otherwise raises User.DoesNotExist
+    """
+    try:
+        return User.objects.filter(
+                        is_superuser=True
+                    ).order_by('id')[0]
+    except IndexError:
+        if User.objects.filter(username='_admin_').count() == 0:
+            admin = User.objects.create_user('_admin_', '')
+            admin.set_unusable_password()
+            admin.set_status('d')
+            return admin
+        else:
+            raise User.DoesNotExist
 
-def get_users_by_text_query(search_query):
+
+def get_moderators():
+    return User.objects.filter(
+            Q(askbot_profile__status='m') | Q(is_superuser=True)
+        ).filter(
+            is_active = True
+        )
+
+
+def get_users_by_role(role_name):
+    """Returns query set of users matching
+    the given role name"""
+    return User.objects.filter(askbot_roles__role=role_name, is_active=True)
+
+
+def get_users_by_text_query(search_query, users_query_set = None):
     """Runs text search in user names and profile.
     For postgres, search also runs against user group names.
     """
-    import askbot
-    if 'postgresql_psycopg2' in askbot.get_database_engine_name():
-        from askbot.search import postgresql
-        return postgresql.run_full_text_search(User.objects.all(), search_query)
+    if getattr(django_settings, 'ENABLE_HAYSTACK_SEARCH', False):
+        from askbot.search.haystack.helpers import get_users_from_query
+        return get_users_from_query(search_query)
     else:
-        return User.objects.filter(
-            models.Q(username__icontains=search_query) |
-            models.Q(about__icontains=search_query)
-        )
-    #if askbot.get_database_engine_name().endswith('mysql') \
-    #    and mysql.supports_full_text_search():
-    #    return User.objects.filter(
-    #        models.Q(username__search = search_query) |
-    #        models.Q(about__search = search_query)
-    #    )
+        import askbot
+        if users_query_set is None:
+            users_query_set = User.objects.all()
+        if 'postgresql_psycopg2' in askbot.get_database_engine_name():
+            from askbot.search import postgresql
+            return postgresql.run_user_search(users_query_set, search_query)
+        else:
+            return users_query_set.filter(
+                models.Q(username__icontains=search_query) |
+                models.Q(localized_askbot_profiles__about__icontains=search_query)
+            )
+        #if askbot.get_database_engine_name().endswith('mysql') \
+        #    and mysql.supports_full_text_search():
+        #    return User.objects.filter(
+        #        models.Q(username__search = search_query) |
+        #        models.Q(localized_user_profiles__about__search = search_query)
+        #    )
 
-User.add_to_class(
-            'status',
-            models.CharField(
-                        max_length = 2,
-                        default = const.DEFAULT_USER_STATUS,
-                        choices = const.USER_STATUS_CHOICES
-                    )
-        )
-User.add_to_class('is_fake', models.BooleanField(default=False))
+class RelatedObjectSimulator(object):
+    '''Objects that simulates the "messages_set" related field
+    somehow django does not creates it automatically in django1.4.1'''
 
-User.add_to_class('email_isvalid', models.BooleanField(default=False)) #@UndefinedVariable
-User.add_to_class('email_key', models.CharField(max_length=32, null=True))
-#hardcoded initial reputaion of 1, no setting for this one
-User.add_to_class('reputation',
-    models.PositiveIntegerField(default=const.MIN_REPUTATION)
-)
-User.add_to_class('gravatar', models.CharField(max_length=32))
-#User.add_to_class('has_custom_avatar', models.BooleanField(default=False))
-User.add_to_class(
-    'avatar_type',
-    models.CharField(max_length=1,
-        choices=const.AVATAR_STATUS_CHOICE,
-        default='n')
-)
-User.add_to_class('gold', models.SmallIntegerField(default=0))
-User.add_to_class('silver', models.SmallIntegerField(default=0))
-User.add_to_class('bronze', models.SmallIntegerField(default=0))
-User.add_to_class(
-    'questions_per_page',  # TODO: remove me and const.QUESTIONS_PER_PAGE_USER_CHOICES, we're no longer used!
-    models.SmallIntegerField(
-        choices=const.QUESTIONS_PER_PAGE_USER_CHOICES,
-        default=10
-    )
-)
-User.add_to_class('last_seen',
-                  models.DateTimeField(default=datetime.datetime.now))
-User.add_to_class('real_name', models.CharField(max_length=100, blank=True))
-User.add_to_class('website', models.URLField(max_length=200, blank=True))
-#location field is actually city
-User.add_to_class('location', models.CharField(max_length=100, blank=True))
-User.add_to_class('country', CountryField(blank = True))
-User.add_to_class('show_country', models.BooleanField(default = False))
+    def __init__(self, user, model_class):
+        self.user = user
+        self.model_class = model_class
 
-User.add_to_class('date_of_birth', models.DateField(null=True, blank=True))
-User.add_to_class('about', models.TextField(blank=True))
-#interesting tags and ignored tags are to store wildcard tag selections only
-User.add_to_class('interesting_tags', models.TextField(blank = True))
-User.add_to_class('ignored_tags', models.TextField(blank = True))
-User.add_to_class('subscribed_tags', models.TextField(blank = True))
-User.add_to_class('email_signature', models.TextField(blank = True))
-User.add_to_class('show_marked_tags', models.BooleanField(default = True))
+    def all(self):
+        return self.model_class.objects.all()
 
-User.add_to_class(
-    'email_tag_filter_strategy',
-    models.SmallIntegerField(
-        choices=const.TAG_DISPLAY_FILTER_STRATEGY_CHOICES,
-        default=const.EXCLUDE_IGNORED
-    )
-)
-User.add_to_class(
-    'display_tag_filter_strategy',
-    models.SmallIntegerField(
-        choices=const.TAG_EMAIL_FILTER_STRATEGY_CHOICES,
-        default=const.INCLUDE_ALL
-    )
-)
+    def count(self, **kwargs):
+        kwargs['user'] = self.user
+        return self.model_class.objects.filter(**kwargs).count()
 
-User.add_to_class('new_response_count', models.IntegerField(default=0))
-User.add_to_class('seen_response_count', models.IntegerField(default=0))
-User.add_to_class('consecutive_days_visit_count', models.IntegerField(default = 0))
+    def create(self, **kwargs):
+        return self.model_class.objects.create(user=self.user, **kwargs)
 
-GRAVATAR_TEMPLATE = "http://www.gravatar.com/avatar/%(gravatar)s?" + \
-    "s=%(size)d&amp;d=%(type)s&amp;r=PG"
+    def filter(self, *args, **kwargs):
+        return self.model_class.objects.filter(*args, **kwargs)
+
+
+#django 1.4.1 and above
+@property
+def user_message_set(self):
+    return RelatedObjectSimulator(self, Message)
+
+#django 1.4.1 and above
+def user_get_and_delete_messages(self):
+    messages = []
+    for message in Message.objects.filter(user=self):
+        messages.append(message.message)
+        message.delete()
+    return messages
+
+User.add_to_class('message_set', user_message_set)
+User.add_to_class('get_and_delete_messages', user_get_and_delete_messages)
+
+#monkeypatches the auth.models.User class with properties
+#that access properties of the askbot.models.UserProfile
+add_profile_properties(User)
+
+GRAVATAR_TEMPLATE = "%(gravatar_url)s/%(gravatar)s?" + \
+    "s=%(size)s&amp;d=%(type)s&amp;r=PG"
 
 def user_get_gravatar_url(self, size):
     """returns gravatar url
     """
     return GRAVATAR_TEMPLATE % {
+                'gravatar_url': askbot_settings.GRAVATAR_BASE_URL,
                 'gravatar': self.gravatar,
                 'type': askbot_settings.GRAVATAR_TYPE,
                 'size': size,
             }
+
+def user_get_reputation(self):
+    if askbot.is_multilingual() and askbot_settings.REPUTATION_LOCALIZED:
+        return self.get_localized_profile().get_reputation()
+    return self.reputation
 
 def user_get_default_avatar_url(self, size):
     """returns default avatar url
     """
     return skin_utils.get_media_url(askbot_settings.DEFAULT_AVATAR_URL)
 
-def user_get_avatar_url(self, size):
+def user_get_avatar_type(self):
+    """returns user avatar type, taking into account
+    avatar_type value and how use of avatar and/or gravatar
+    is configured
+    Value returned is one of 'n', 'a', 'g'.
+    """
+    if 'avatar' in django_settings.INSTALLED_APPS:
+        if self.avatar_type == 'g':
+            if askbot_settings.ENABLE_GRAVATAR:
+                return 'g'
+            else:
+                #fallback to default avatar if gravatar is disabled
+                return 'n'
+        assert(self.avatar_type in ('a', 'n'))#only these are allowed
+        return self.avatar_type
+
+    #if we don't have an uploaded avatar, always use gravatar
+    return 'g'
+
+
+def user_get_avatar_url(self, size=48):
+    """returns avatar url for a given size
+    JSONField .avatar_urls is used as "cache"
+    to avoid multiple db hits to fetch avatar urls
+    """
+    size = str(size)
+    url = self.avatar_urls.get(size)
+    if not url:
+        url = self.calculate_avatar_url(size)
+        self.avatar_urls[size] = url
+    return url
+
+
+#todo: find where this is used and replace with get_absolute_url
+def user_get_profile_url(self, profile_section=None, language_code=None):
+    """Returns the URL for this User's profile."""
+    cur_lang = get_language()
+
+    if language_code and cur_lang != language_code:
+        translation.activate(language_code)
+
+    url = reverse(
+            'user_profile',
+            kwargs={'id': self.id, 'slug': slugify(self.username)}
+        )
+
+    if language_code and cur_lang != language_code:
+        translation.activate(cur_lang)
+
+    if profile_section:
+        url += "?sort=" + profile_section
+    return url
+
+
+def user_get_absolute_url(self, language_code=None):
+    return self.get_profile_url(language_code=language_code)
+
+
+def user_get_unsubscribe_url(self):
+    url = reverse('user_unsubscribe')
+    email_key = self.get_or_create_email_key()
+    return '{0}?key={1}&email={2}'.format(url, self.email_key, self.email)
+
+
+def user_get_subscriptions_url(self):
+    return reverse(
+            'user_subscriptions',
+            kwargs={'id': self.id, 'slug': slugify(self.username)}
+        )
+
+
+def user_calculate_avatar_url(self, size=48):
     """returns avatar url - by default - gravatar,
     but if application django-avatar is installed
     it will use avatar provided through that app
     """
-    if 'avatar' in django_settings.INSTALLED_APPS:
-        if self.avatar_type == 'n':
-            import avatar
-            if askbot_settings.ENABLE_GRAVATAR: #avatar.settings.AVATAR_GRAVATAR_BACKUP:
-                return self.get_gravatar_url(size)
-            else:
-                return self.get_default_avatar_url(size)
-        elif self.avatar_type == 'a':
-            kwargs = {'user_id': self.id, 'size': size}
-            try:
-                return reverse('avatar_render_primary', kwargs = kwargs)
-            except NoReverseMatch:
-                message = 'Please, make sure that avatar urls are in the urls.py '\
-                          'or update your django-avatar app, '\
-                          'currently it is impossible to serve avatars.'
-                logging.critical(message)
-                raise django_exceptions.ImproperlyConfigured(message)
-        else:
-            return self.get_gravatar_url(size)
-    else:
-        if askbot_settings.ENABLE_GRAVATAR:
-            return self.get_gravatar_url(size)
-        else:
-            return self.get_default_avatar_url(size)
+    avatar_type = self.get_avatar_type()
+    size = int(size)
+
+    if avatar_type == 'n':
+        return self.get_default_avatar_url(size)
+    elif avatar_type == 'a':
+        from avatar.conf import settings as avatar_settings
+        sizes = avatar_settings.AVATAR_AUTO_GENERATE_SIZES
+        if size not in sizes:
+            logging.critical(
+                'add values %d to setting AVATAR_AUTO_GENERATE_SIZES',
+                size
+            )
+
+        try:
+            from avatar.utils import get_primary_avatar
+        except ImportError as error:
+            # If the updated version of django-avatar isn't installed
+            # Let's fall back
+            from avatar.util import get_primary_avatar
+            logging.warning("Using deprecated version of django-avatar")
+
+        avatar = get_primary_avatar(self, size=size)
+        if avatar:
+            return avatar.avatar_url(size)
+        return self.get_default_avatar_url(size)
+
+    assert(avatar_type == 'g')
+    return self.get_gravatar_url(size)
+
+
+def user_clear_avatar_urls(self):
+    """Assigns avatar urls for each required size.
+    """
+    self.avatar_urls = {}
+
+def user_init_avatar_urls(self):
+    """Assigns missing avatar urls,
+    assumes that remaining avatars are correct"""
+    from avatar.conf import settings as avatar_settings
+    sizes = avatar_settings.AVATAR_AUTO_GENERATE_SIZES
+    for size in sizes:
+        if size not in self.avatar_urls:
+            self.avatar_urls[size] = self.calculate_avatar_url(size)
+
+
+def user_get_top_answers_paginator(self, visitor=None):
+    """get paginator for top answers by the user for a
+    specific visitor"""
+    answers = self.posts.get_answers(
+                                visitor
+                            ).filter(
+                                deleted=False,
+                                thread__deleted=False
+                            ).select_related(
+                                'thread'
+                            ).order_by(
+                                '-points', '-added_at'
+                            )
+    return Paginator(answers, const.USER_POSTS_PAGE_SIZE)
 
 def user_update_avatar_type(self):
     """counts number of custom avatars
@@ -208,7 +370,6 @@ def user_update_avatar_type(self):
             self.avatar_type = _check_gravatar(self.gravatar)
     else:
             self.avatar_type = _check_gravatar(self.gravatar)
-    self.save()
 
 def user_strip_email_signature(self, text):
     """strips email signature from the end of the text"""
@@ -221,7 +382,10 @@ def user_strip_email_signature(self, text):
     return text
 
 def _check_gravatar(gravatar):
-    gravatar_url = "http://www.gravatar.com/avatar/%s?d=404" % gravatar
+    return 'n'
+    #todo: think of whether we need this and if so
+    #how to check the avatar type appropriately
+    gravatar_url = askbot_settings.GRAVATAR_BASE_URL + "/%s?d=404" % gravatar
     code = urllib.urlopen(gravatar_url).getcode()
     if urllib.urlopen(gravatar_url).getcode() != 404:
         return 'g' #gravatar
@@ -250,8 +414,9 @@ def user_get_marked_tags(self, reason):
             return Tag.objects.none()
 
     return Tag.objects.filter(
-        user_selections__user = self,
-        user_selections__reason = reason
+        user_selections__user=self,
+        user_selections__reason=reason,
+        language_code=get_language()
     )
 
 MARKED_TAG_PROPERTY_MAP = {
@@ -275,7 +440,7 @@ def user_get_marked_tag_names(self, reason):
         attr_name = MARKED_TAG_PROPERTY_MAP[reason]
         wildcard_tags = getattr(self, attr_name).split()
         tag_names.extend(wildcard_tags)
-        
+
     return tag_names
 
 def user_has_affinity_to_question(self, question = None, affinity_type = None):
@@ -333,16 +498,103 @@ def user_has_interesting_wildcard_tags(self):
         and self.interesting_tags != ''
     )
 
+def user_has_badge(self, badge):
+    """True, if user was awarded a given badge,
+    ``badge`` is instance of BadgeData
+    """
+    return Award.objects.filter(user=self, badge=badge).count() > 0
+
+
+def user_can_create_tags(self):
+    """true if user can create tags"""
+    if askbot_settings.ENABLE_TAG_MODERATION:
+        return self.is_administrator_or_moderator()
+    else:
+        return True
+
+
+def user_can_terminate_account(self, user):
+    """True, if `self` can terminate account of `user`"""
+    perm = askbot_settings.WHO_CAN_TERMINATE_ACCOUNTS
+    is_admin = self.has_role('terminate_accounts')
+    if self.pk == user.pk:
+        if is_admin: #admin can't remove own account, as as safeguard
+            return False
+        return perm == 'users'
+    return is_admin
+
+
+def user_can_manage_account(self, user):
+    """True, if `self` can see the "manage account" page of `user`"""
+    return self.pk == user.pk or \
+           self.has_role('terminate_accounts') or \
+           self.has_role('download_user_data')
+
+
+def user_has_role(self, role_name):
+    """True, if `self` has `role_name` Role in their role set"""
+    return self.is_active and self.askbot_roles.filter(role=role_name).exists()
+
+
+def user_get_roles(self):
+    """Returns set of user role names"""
+    return set(self.askbot_roles.values_list('role', flat=True))
+
+
 def user_can_have_strong_url(self):
     """True if user's homepage url can be
     followed by the search engine crawlers"""
     return (self.reputation >= askbot_settings.MIN_REP_TO_HAVE_STRONG_URL)
 
+
 def user_can_post_by_email(self):
-    """True, if reply by email is enabled 
+    """True, if reply by email is enabled
     and user has sufficient reputatiton"""
-    return askbot_settings.REPLY_BY_EMAIL and \
-        self.reputation > askbot_settings.MIN_REP_TO_POST_BY_EMAIL
+
+    if askbot_settings.REPLY_BY_EMAIL:
+        if self.is_administrator_or_moderator():
+            return True
+        else:
+            return self.reputation >= askbot_settings.MIN_REP_TO_POST_BY_EMAIL
+    else:
+        return False
+
+
+def user_can_see_karma(user, karma_owner):
+    """True, if user can see other users karma"""
+    if askbot_settings.KARMA_MODE == 'public':
+        return True
+    elif askbot_settings.KARMA_MODE == 'private':
+        if user.is_anonymous():
+            return False
+        elif user.is_administrator_or_moderator():
+            return True
+        elif user.pk == karma_owner.pk:
+            return True
+    return False
+
+
+def user_get_social_sharing_mode(self):
+    """returns what user wants to share on his/her channels"""
+    mode = self.social_sharing_mode
+    if mode == const.SHARE_NOTHING:
+        return 'share-nothing'
+    elif mode == const.SHARE_MY_POSTS:
+        return 'share-my-posts'
+    else:
+        assert(mode == const.SHARE_EVERYTHING)
+        return 'share-everything'
+
+def user_get_social_sharing_status(self, channel):
+    """channel is only 'twitter' for now"""
+    assert(channel == 'twitter')
+    if self.twitter_handle:
+        if self.get_social_sharing_mode() == 'share-nothing':
+            return 'inactive'
+        else:
+            return 'enabled'
+    else:
+        return 'disabled'
 
 def user_get_or_create_fake_user(self, username, email):
     """
@@ -362,20 +614,72 @@ def user_get_or_create_fake_user(self, username, email):
         user.save()
     return user
 
+def get_or_create_anonymous_user():
+    """returns fake anonymous user"""
+    username = get_name_of_anonymous_user()
+    try:
+        user = User.objects.get(username=username)
+    except User.DoesNotExist:
+        user = User()
+        user.username = username
+        user.email = askbot_settings.ANONYMOUS_USER_EMAIL
+        user.is_fake = True
+        user.set_unusable_password()
+        user.save()
+    return user
+
+def user_needs_moderation(self):
+    if self.status not in ('a', 'm', 'd'):
+        choices = ('audit', 'premoderation')
+        return askbot_settings.CONTENT_MODERATION_MODE in choices
+    return False
+
+def user_notify_users(
+    self, notification_type=None, recipients=None, content_object=None
+):
+    """A utility function that creates instance
+    of :class:`Activity` and adds recipients
+    * `notification_type` - value should be one of TYPE_ACTIVITY_...
+    * `recipients` - an iterable of user objects
+    * `content_object` - any object related to the notification
+
+    todo: possibly add checks on the content_object, depending on the
+    notification_type
+    """
+    activity = Activity(
+                user=self,
+                activity_type=notification_type,
+                content_object=content_object
+            )
+    activity.save()
+    activity.add_recipients(recipients)
+
+def user_is_read_only(self):
+    """True if user is allowed to change content on the site"""
+    if askbot_settings.GROUPS_ENABLED:
+        return bool(self.get_groups().filter(read_only=True).count())
+    else:
+        return False
+
+def user_get_notifications(self, notification_types=None, **kwargs):
+    """returns query set of activity audit status objects"""
+    return ActivityAuditStatus.objects.filter(
+                        user=self,
+                        activity__activity_type__in=notification_types,
+                        **kwargs
+                    )
+
 def _assert_user_can(
-                        user = None,
-                        post = None, #related post (may be parent)
-                        admin_or_moderator_required = False,
-                        owner_can = False,
-                        suspended_owner_cannot = False,
-                        owner_min_rep_setting = None,
-                        blocked_error_message = None,
-                        suspended_error_message = None,
-                        min_rep_setting = None,
-                        low_rep_error_message = None,
-                        owner_low_rep_error_message = None,
-                        general_error_message = None
-                    ):
+        user=None,
+        post=None, #related post (may be parent)
+        admin_or_moderator_required=False,
+        owner_can=False,
+        action_display=None,
+        suspended_owner_cannot=False,
+        suspended_user_cannot=False,
+        blocked_user_cannot=False,
+        min_rep_setting=None
+    ):
     """generic helper assert for use in several
     User.assert_can_XYZ() calls regarding changing content
 
@@ -384,107 +688,167 @@ def _assert_user_can(
     if assertion fails, method raises exception.PermissionDenied
     with appropriate text as a payload
     """
-    if blocked_error_message and user.is_blocked():
-        error_message = blocked_error_message
-    elif post and owner_can and user == post.get_owner():
-        if owner_min_rep_setting:
-            if post.get_owner().reputation < owner_min_rep_setting:
-                if user.is_moderator() or user.is_administrator():
-                    return
-                else:
-                    assert(owner_low_rep_error_message is not None)
-                    raise askbot_exceptions.InsufficientReputation(
-                                                owner_low_rep_error_message
-                                            )
-        if suspended_owner_cannot and user.is_suspended():
-            if suspended_error_message:
-                error_message = suspended_error_message
-            else:
-                error_message = general_error_message
-            assert(error_message is not None)
-            raise django_exceptions.PermissionDenied(error_message)
+    action_display = action_display or _('perform this action')
+
+    from askbot.deps.django_authopenid.util import email_is_blacklisted
+
+    if askbot_settings.READ_ONLY_MODE_ENABLED:
+        error_message = _(
+            'Sorry, you cannot %(perform_action)s because '
+            'the site is temporarily read only'
+        ) % {'perform_action': action_display}
+
+    elif ('@' in user.email) and email_is_blacklisted(user.email) \
+        and askbot_settings.BLACKLISTED_EMAIL_PATTERNS_MODE == 'strict':
+        error_message = string_concat(
+            _('Sorry, you cannot %(perform_action)s because '
+              '%(domain)s emails have been blacklisted.'
+            ),
+            ' ',
+            _('Please <a href="%(url)s">change your email</a>.')
+        ) % {
+            'perform_action': action_display,
+            'domain': user.email.split('@')[1],
+            'url': reverse('edit_user', args=(user.id,))
+        }
+
+    elif user.is_read_only():
+        error_message = _('Sorry, but you have only read access')
+
+    elif user.is_active == False:
+        error_message = getattr(
+                            django_settings,
+                            'ASKBOT_INACTIVE_USER_MESSAGE',
+                            _(message_keys.ACCOUNT_CANNOT_PERFORM_ACTION) % {
+                                'perform_action': action_display,
+                                'your_account_is': _('your account is disabled')
+                            }
+                        )
+
+    elif blocked_user_cannot and user.is_blocked():
+        error_message = _(message_keys.ACCOUNT_CANNOT_PERFORM_ACTION) % {
+            'perform_action': action_display,
+            'your_account_is': _('your account is blocked')
+        }
+        error_message = string_concat(error_message, '.</br> ', _(message_keys.PUNISHED_USER_INFO))
+
+    elif post and owner_can and user.pk == post.author_id:
+        if user.is_suspended() and suspended_owner_cannot:
+            error_message = _(message_keys.ACCOUNT_CANNOT_PERFORM_ACTION) % {
+                'perform_action': action_display,
+                'your_account_is': _('your account is suspended')
+            }
         else:
             return
-        return
-    elif suspended_error_message and user.is_suspended():
-        error_message = suspended_error_message
+
+    elif suspended_user_cannot and user.is_suspended():
+        error_message = _(message_keys.ACCOUNT_CANNOT_PERFORM_ACTION) % {
+            'perform_action': action_display,
+            'your_account_is': _('your account is suspended')
+        }
+
     elif user.is_administrator() or user.is_moderator():
         return
-    elif low_rep_error_message and user.reputation < min_rep_setting:
-        raise askbot_exceptions.InsufficientReputation(low_rep_error_message)
-    else:
-        if admin_or_moderator_required == False:
-            return
 
-    #if admin or moderator is required, then substitute the message
-    if admin_or_moderator_required:
-        error_message = general_error_message
+    elif user.is_post_moderator(post):
+        return
+
+    elif min_rep_setting and user.reputation < min_rep_setting:
+        raise askbot_exceptions.InsufficientReputation(
+            _(message_keys.MIN_REP_REQUIRED_TO_PERFORM_ACTION) % {
+                'perform_action': action_display,
+                'min_rep': min_rep_setting
+            }
+        )
+
+    elif admin_or_moderator_required:
+        if min_rep_setting is None:
+            #message about admins only
+            error_message = _(
+                'Sorry, only moderators and site administrators can %(perform_action)s'
+            ) % {
+                'perform_action': action_display
+            }
+        else:
+            #message with minimum reputation
+            error_message = _(
+                'Sorry, only administrators, moderators '
+                'or users with reputation > %(min_rep)s '
+                'can %(perform_action)s'
+            ) % {
+                'min_rep': min_rep_setting,
+                'perform_action': action_display
+            }
+    else:
+        return
+
     assert(error_message is not None)
     raise django_exceptions.PermissionDenied(error_message)
 
 def user_assert_can_approve_post_revision(self, post_revision = None):
     _assert_user_can(
-        user = self,
-        admin_or_moderator_required = True
+        user=self,
+        admin_or_moderator_required=True
     )
 
-def user_assert_can_unaccept_best_answer(self, answer = None):
+def user_assert_can_unaccept_best_answer(self, answer=None):
     assert getattr(answer, 'post_type', '') == 'answer'
-    blocked_error_message = _(
-            'Sorry, you cannot accept or unaccept best answers '
-            'because your account is blocked'
-        )
-    suspended_error_message = _(
-            'Sorry, you cannot accept or unaccept best answers '
-            'because your account is suspended'
-        )
+    suspended_error_message = _(message_keys.ACCOUNT_CANNOT_PERFORM_ACTION) % {
+        'perform_action': askbot_settings.WORDS_ACCEPT_OR_UNACCEPT_THE_BEST_ANSWER,
+        'your_account_is': _('your account is suspended')
+    }
+    blocked_error_message = _(message_keys.ACCOUNT_CANNOT_PERFORM_ACTION) % {
+        'perform_action': askbot_settings.WORDS_ACCEPT_OR_UNACCEPT_THE_BEST_ANSWER,
+        'your_account_is': _('your account is blocked')
+    }
+
     if self.is_blocked():
         error_message = blocked_error_message
     elif self.is_suspended():
         error_message = suspended_error_message
-    elif self == answer.thread._question_post().get_owner():
-        if self == answer.get_owner():
+    elif self.pk == answer.thread._question_post().author_id:
+        if self.pk == answer.author_id:
             if not self.is_administrator():
                 #check rep
-                min_rep_setting = askbot_settings.MIN_REP_TO_ACCEPT_OWN_ANSWER
-                low_rep_error_message = _(
-                            ">%(points)s points required to accept or unaccept "
-                            " your own answer to your own question"
-                        ) % {'points': min_rep_setting}
-
                 _assert_user_can(
-                    user = self,
-                    blocked_error_message = blocked_error_message,
-                    suspended_error_message = suspended_error_message,
-                    min_rep_setting = min_rep_setting,
-                    low_rep_error_message = low_rep_error_message
+                    user=self,
+                    action_display=askbot_settings.WORDS_ACCEPT_OR_UNACCEPT_OWN_ANSWER,
+                    blocked_user_cannot=True,
+                    suspended_owner_cannot=True,
+                    min_rep_setting = askbot_settings.MIN_REP_TO_ACCEPT_OWN_ANSWER
                 )
         return # success
 
     elif self.is_administrator() or self.is_moderator():
+        return # success
+
+    elif self.reputation >= askbot_settings.MIN_REP_TO_ACCEPT_ANY_ANSWER or \
+        self.is_post_moderator(answer):
+
         will_be_able_at = (
             answer.added_at +
             datetime.timedelta(
                 days=askbot_settings.MIN_DAYS_FOR_STAFF_TO_ACCEPT_ANSWER)
         )
 
-        if datetime.datetime.now() < will_be_able_at:
-            error_message = _(
-                'Sorry, you will be able to accept this answer '
-                'only after %(will_be_able_at)s'
-                ) % {'will_be_able_at': will_be_able_at.strftime('%d/%m/%Y')}
+        if timezone.now() < will_be_able_at:
+            error_message = _(message_keys.CANNOT_PERFORM_ACTION_UNTIL) % {
+                'perform_action': askbot_settings.WORDS_ACCEPT_OR_UNACCEPT_THE_BEST_ANSWER,
+                'until': will_be_able_at.strftime('%d/%m/%Y')
+            }
         else:
             return
 
     else:
-        error_message = _(
-            'Sorry, only moderators or original author of the question '
-            ' - %(username)s - can accept or unaccept the best answer'
-            ) % {'username': answer.get_owner().username}
+        question_owner = answer.thread._question_post().author
+        error_message = _(message_keys.MODERATORS_OR_AUTHOR_CAN_PEFROM_ACTION) % {
+            'post_author': askbot_settings.WORDS_AUTHOR_OF_THE_QUESTION,
+            'perform_action': askbot_settings.WORDS_ACCEPT_OR_UNACCEPT_THE_BEST_ANSWER,
+        }
 
     raise django_exceptions.PermissionDenied(error_message)
 
-def user_assert_can_accept_best_answer(self, answer = None):
+def user_assert_can_accept_best_answer(self, answer=None):
     assert getattr(answer, 'post_type', '') == 'answer'
     self.assert_can_unaccept_best_answer(answer)
 
@@ -499,91 +863,114 @@ def user_assert_can_vote_for_post(
     :param:direction can be 'up' or 'down'
     :param:post can be instance of question or answer
     """
-    if self == post.author:
+    if self.pk == post.author_id:
         raise django_exceptions.PermissionDenied(
             _('Sorry, you cannot vote for your own posts')
         )
-
-    blocked_error_message = _(
-                'Sorry your account appears to be blocked ' +
-                'and you cannot vote - please contact the ' +
-                'site administrator to resolve the issue'
-            ),
-    suspended_error_message = _(
-                'Sorry your account appears to be suspended ' +
-                'and you cannot vote - please contact the ' +
-                'site administrator to resolve the issue'
-            )
 
     assert(direction in ('up', 'down'))
 
     if direction == 'up':
         min_rep_setting = askbot_settings.MIN_REP_TO_VOTE_UP
-        low_rep_error_message = _(
-                    ">%(points)s points required to upvote"
-                ) % \
-                {'points': askbot_settings.MIN_REP_TO_VOTE_UP}
+        action_display = _('upvote')
     else:
         min_rep_setting = askbot_settings.MIN_REP_TO_VOTE_DOWN
-        low_rep_error_message = _(
-                    ">%(points)s points required to downvote"
-                ) % \
-                {'points': askbot_settings.MIN_REP_TO_VOTE_DOWN}
+        action_display = _('downvote')
 
     _assert_user_can(
-        user = self,
-        blocked_error_message = blocked_error_message,
-        suspended_error_message = suspended_error_message,
+        user=self,
+        action_display=action_display,
+        blocked_user_cannot=True,
+        suspended_user_cannot=True,
         min_rep_setting = min_rep_setting,
-        low_rep_error_message = low_rep_error_message
     )
 
 
 def user_assert_can_upload_file(request_user):
-
-    blocked_error_message = _('Sorry, blocked users cannot upload files')
-    suspended_error_message = _('Sorry, suspended users cannot upload files')
-    low_rep_error_message = _(
-                        'sorry, file uploading requires karma >%(min_rep)s',
-                    ) % {'min_rep': askbot_settings.MIN_REP_TO_UPLOAD_FILES }
-
     _assert_user_can(
-        user = request_user,
-        suspended_error_message = suspended_error_message,
-        min_rep_setting = askbot_settings.MIN_REP_TO_UPLOAD_FILES,
-        low_rep_error_message = low_rep_error_message
+        user=request_user,
+        action_display=_('upload files'),
+        blocked_user_cannot=True,
+        suspended_user_cannot=True,
+        min_rep_setting=askbot_settings.MIN_REP_TO_UPLOAD_FILES
     )
+
+
+def user_assert_can_join_or_leave_group(self):
+    _assert_user_can(
+        user=self,
+        action_display=_('join or leave groups'),
+        blocked_user_cannot=True,
+        suspended_user_cannot=True
+    )
+User.add_to_class(
+    'assert_can_join_or_leave_group',
+    user_assert_can_join_or_leave_group
+)
+
+
+def user_assert_can_mark_tags(self):
+    _assert_user_can(
+        user=self,
+        action_display=_('mark or unmark tags'),
+        blocked_user_cannot=True,
+    )
+
+
+def user_assert_can_merge_questions(self):
+    _assert_user_can(
+        user=self,
+        action_display=_('merge duplicate questions'),
+        admin_or_moderator_required=True
+    )
+
+
+def user_assert_can_post_text(self, text):
+    """Raises exceptions.PermissionDenied, if user does not have
+    privilege to post given text, depending on the contents
+    """
+    if re.search(URL_RE, text):
+        min_rep = askbot_settings.MIN_REP_TO_SUGGEST_LINK
+        if self.is_authenticated() and self.reputation < min_rep:
+            message = _(
+                'Could not post, because your karma is insufficient to publish links'
+            )
+            raise django_exceptions.PermissionDenied(message)
 
 
 def user_assert_can_post_question(self):
     """raises exceptions.PermissionDenied with
     text that has the reason for the denial
     """
-
-    blocked_message = get_i18n_message('BLOCKED_USERS_CANNOT_POST')
-    suspended_message = get_i18n_message('SUSPENDED_USERS_CANNOT_POST')
-
     _assert_user_can(
-            user = self,
-            blocked_error_message = blocked_message,
-            suspended_error_message = suspended_message
+        user=self,
+        action_display=askbot_settings.WORDS_ASK_QUESTIONS,
+        blocked_user_cannot=True,
+        suspended_user_cannot=True,
     )
 
 
-def user_assert_can_post_answer(self, thread = None):
+def user_assert_can_post_answer(self, thread=None):
     """same as user_can_post_question
     """
     limit_answers = askbot_settings.LIMIT_ONE_ANSWER_PER_USER
     if limit_answers and thread.has_answer_by_user(self):
         message = _(
-            'Sorry, you already gave an answer, please edit it instead.'
-        )
+            'Sorry, %(you_already_gave_an_answer)s, please edit it instead.'
+        ) % {
+            'you_already_gave_an_answer': askbot_settings.WORDS_YOU_ALREADY_GAVE_AN_ANSWER
+        }
         raise askbot_exceptions.AnswerAlreadyGiven(message)
 
-    self.assert_can_post_question()
+    _assert_user_can(
+        user=self,
+        action_display=askbot_settings.WORDS_POST_ANSWERS,
+        blocked_user_cannot=True,
+        suspended_user_cannot=True,
+    )
 
 
-def user_assert_can_edit_comment(self, comment = None):
+def user_assert_can_edit_comment(self, comment=None):
     """raises exceptions.PermissionDenied if user
     cannot edit comment with the reason given as message
 
@@ -591,25 +978,34 @@ def user_assert_can_edit_comment(self, comment = None):
     """
     if self.is_administrator() or self.is_moderator():
         return
-    else:
-        if comment.author == self:
-            if askbot_settings.USE_TIME_LIMIT_TO_EDIT_COMMENT:
-                now = datetime.datetime.now()
-                delta_seconds = 60 * askbot_settings.MINUTES_TO_EDIT_COMMENT
-                if now - comment.added_at > datetime.timedelta(0, delta_seconds):
-                    if comment.is_last():
-                        return
-                    error_message = ungettext(
-                        'Sorry, comments (except the last one) are editable only '
-                        'within %(minutes)s minute from posting',
-                        'Sorry, comments (except the last one) are editable only '
-                        'within %(minutes)s minutes from posting',
-                        askbot_settings.MINUTES_TO_EDIT_COMMENT
-                    ) % {'minutes': askbot_settings.MINUTES_TO_EDIT_COMMENT}
-                    raise django_exceptions.PermissionDenied(error_message)
-                return
-            else:
-                return
+
+    if comment.thread and comment.thread.closed:
+        if askbot_settings.COMMENTING_CLOSED_QUESTIONS_ENABLED == False:
+            error_message = _('Sorry, commenting closed entries is not allowed')
+            raise django_exceptions.PermissionDenied(error_message)
+
+    if comment.author_id == self.pk:
+        if askbot_settings.USE_TIME_LIMIT_TO_EDIT_COMMENT:
+            now = timezone.now()
+            delta_seconds = 60 * askbot_settings.MINUTES_TO_EDIT_COMMENT
+            if now - comment.added_at > datetime.timedelta(0, delta_seconds):
+                if comment.is_last():
+                    return
+                error_message = ungettext(
+                    'Sorry, comments (except the last one) are editable only '
+                    'within %(minutes)s minute from posting',
+                    'Sorry, comments (except the last one) are editable only '
+                    'within %(minutes)s minutes from posting',
+                    askbot_settings.MINUTES_TO_EDIT_COMMENT
+                ) % {'minutes': askbot_settings.MINUTES_TO_EDIT_COMMENT}
+                raise django_exceptions.PermissionDenied(error_message)
+            return
+        else:
+            return
+
+    if not (self.is_blocked() or self.is_suspended()):
+        if self.reputation >= askbot_settings.MIN_REP_TO_EDIT_OTHERS_POSTS:
+            return
 
     error_message = _(
         'Sorry, but only post owners or moderators can edit comments'
@@ -617,83 +1013,97 @@ def user_assert_can_edit_comment(self, comment = None):
     raise django_exceptions.PermissionDenied(error_message)
 
 
-def user_can_post_comment(self, parent_post = None):
+def user_assert_can_convert_post(self, post=None):
+    """raises exceptions.PermissionDenied if user is not allowed to convert the
+    post to another type (comment -> answer, answer -> comment)
+
+    only owners, moderators or admins can convert posts
+    """
+    _assert_user_can(
+        user=self,
+        action_display=_('repost items'),
+        owner_can=True,
+        blocked_user_cannot=True,
+    )
+
+
+def user_can_post_comment(self, parent_post=None):
     """a simplified method to test ability to comment
     """
-    if self.reputation >= askbot_settings.MIN_REP_TO_LEAVE_COMMENTS:
-        return True
-    if parent_post and self == parent_post.author:
-        return True
     if self.is_administrator_or_moderator():
         return True
-    return False
 
+    elif parent_post.thread and parent_post.thread.closed:
+        if askbot_settings.COMMENTING_CLOSED_QUESTIONS_ENABLED == False:
+            return False
 
-def user_assert_can_post_comment(self, parent_post = None):
+    elif self.is_suspended():
+        if parent_post and self.pk == parent_post.author_id:
+            return True
+        else:
+            return False
+    elif self.is_blocked():
+        return False
+
+    return True
+
+def user_assert_can_post_comment(self, parent_post=None):
     """raises exceptions.PermissionDenied if
     user cannot post comment
 
     the reason will be in text of exception
     """
+    _assert_user_can(
+        user=self,
+        post=parent_post,
+        action_display=_('post comments'),
+        owner_can=True,
+        blocked_user_cannot=True,
+        suspended_user_cannot=True,
+    )
 
-    suspended_error_message = _(
-                'Sorry, since your account is suspended '
-                'you can comment only your own posts'
-            )
-    low_rep_error_message = _(
-                'Sorry, to comment any post a minimum reputation of '
-                '%(min_rep)s points is required. You can still comment '
-                'your own posts and answers to your questions'
-            ) % {'min_rep': askbot_settings.MIN_REP_TO_LEAVE_COMMENTS}
+    if self.is_administrator_or_moderator():
+        return
 
-    blocked_message = get_i18n_message('BLOCKED_USERS_CANNOT_POST')
+    if parent_post.thread and parent_post.thread.closed:
+        if askbot_settings.COMMENTING_CLOSED_QUESTIONS_ENABLED == False:
+            error_message = _('Sorry, commenting closed entries is not allowed')
+            raise django_exceptions.PermissionDenied(error_message)
 
-    try:
-        _assert_user_can(
-            user = self,
-            post = parent_post,
-            owner_can = True,
-            blocked_error_message = blocked_message,
-            suspended_error_message = suspended_error_message,
-            min_rep_setting = askbot_settings.MIN_REP_TO_LEAVE_COMMENTS,
-            low_rep_error_message = low_rep_error_message,
-        )
-    except askbot_exceptions.InsufficientReputation, e:
-        if parent_post.post_type == 'answer':
-            if self == parent_post.thread._question_post().author:
-                return
-        raise e
-
-def user_assert_can_see_deleted_post(self, post = None):
+def user_assert_can_see_deleted_post(self, post=None):
 
     """attn: this assertion is independently coded in
     Question.get_answers call
     """
+    try:
+        _assert_user_can(
+            user=self,
+            post=post,
+            admin_or_moderator_required=True,
+            owner_can=True
+        )
+    except django_exceptions.PermissionDenied as e:
+        #re-raise the same exception with a different message
+        error_message = _(
+            'This post has been deleted and can be seen only '
+            'by post owners, site administrators and moderators'
+        )
+        raise django_exceptions.PermissionDenied(error_message)
 
-    error_message = _(
-                        'This post has been deleted and can be seen only '
-                        'by post owners, site administrators and moderators'
-                    )
-    _assert_user_can(
-        user = self,
-        post = post,
-        admin_or_moderator_required = True,
-        owner_can = True,
-        general_error_message = error_message
-    )
 
 def user_assert_can_edit_deleted_post(self, post = None):
     assert(post.deleted == True)
     try:
         self.assert_can_see_deleted_post(post)
-    except django_exceptions.PermissionDenied, e:
+    except django_exceptions.PermissionDenied as e:
         error_message = _(
-                    'Sorry, only moderators, site administrators '
-                    'and post owners can edit deleted posts'
-                )
+            'Sorry, only moderators, site administrators '
+            'and post owners can edit deleted posts'
+        )
         raise django_exceptions.PermissionDenied(error_message)
 
-def user_assert_can_edit_post(self, post = None):
+
+def user_assert_can_edit_post(self, post=None):
     """assertion that raises exceptions.PermissionDenied
     when user is not authorised to edit this post
     """
@@ -702,38 +1112,57 @@ def user_assert_can_edit_post(self, post = None):
         self.assert_can_edit_deleted_post(post)
         return
 
-    blocked_error_message = _(
-                'Sorry, since your account is blocked '
-                'you cannot edit posts'
-            )
-    suspended_error_message = _(
-                'Sorry, since your account is suspended '
-                'you can edit only your own posts'
-            )
     if post.wiki == True:
-        low_rep_error_message = _(
-                    'Sorry, to edit wiki posts, a minimum '
-                    'reputation of %(min_rep)s is required'
-                ) % \
-                {'min_rep': askbot_settings.MIN_REP_TO_EDIT_WIKI}
+        action_display=_('edit wiki posts')
         min_rep_setting = askbot_settings.MIN_REP_TO_EDIT_WIKI
     else:
-        low_rep_error_message = _(
-                    'Sorry, to edit other people\'s posts, a minimum '
-                    'reputation of %(min_rep)s is required'
-                ) % \
-                {'min_rep': askbot_settings.MIN_REP_TO_EDIT_OTHERS_POSTS}
+        action_display=_('edit posts')
         min_rep_setting = askbot_settings.MIN_REP_TO_EDIT_OTHERS_POSTS
 
     _assert_user_can(
-        user = self,
-        post = post,
-        owner_can = True,
-        blocked_error_message = blocked_error_message,
-        suspended_error_message = suspended_error_message,
-        low_rep_error_message = low_rep_error_message,
-        min_rep_setting = min_rep_setting
+        user=self,
+        post=post,
+        action_display=action_display,
+        owner_can=True,
+        blocked_user_cannot=True,
+        suspended_user_cannot=True,
+        min_rep_setting=min_rep_setting
     )
+
+    #mods can edit posts without time limit
+    if self.is_administrator() or self.is_moderator():
+        return
+
+    #question is editable without limit as long as there are no answers
+    if post.is_question():
+        if post.thread.answer_count == 0:
+            return
+
+    if post.is_answer():
+        use_limit = askbot_settings.USE_TIME_LIMIT_TO_EDIT_ANSWER
+        minutes_limit = askbot_settings.MINUTES_TO_EDIT_ANSWER
+    elif post.is_question():
+        use_limit = askbot_settings.USE_TIME_LIMIT_TO_EDIT_QUESTION
+        minutes_limit = askbot_settings.MINUTES_TO_EDIT_QUESTION
+    else:
+        return
+
+    if use_limit == False:
+        return
+
+    now = timezone.now()
+    delta_seconds = 60 * minutes_limit
+    if now - post.added_at > datetime.timedelta(0, delta_seconds):
+        #vague message because it is hard to add
+        #these phrases to askbot.conf.words as parameters
+        error_message = ungettext(
+            'Sorry, posts like this are editable only '
+            'within %(minutes)s minute from posting',
+            'Sorry, posts like this are editable only '
+            'within %(minutes)s minutes from posting',
+            minutes_limit
+        ) % {'minutes': minutes_limit}
+        raise django_exceptions.PermissionDenied(error_message)
 
 
 def user_assert_can_edit_question(self, question = None):
@@ -771,24 +1200,30 @@ def user_assert_can_delete_question(self, question = None):
     #cheating here. can_delete_answer wants argument named
     #"question", so the argument name is skipped
     self.assert_can_delete_answer(question)
-    if self == question.get_owner():
+    if self.is_administrator() or self.is_moderator():
+        return
+    if self.pk == question.author_id:
         #if there are answers by other people,
-        #then deny, unless user in admin or moderator
+
+        answer_count = question.thread.all_answers().exclude(author=self).count()
+        min_karma = askbot_settings.MIN_REP_TO_DELETE_OWN_QUESTIONS
+        if answer_count and self.reputation < min_karma:
+            msg = _('At least %d karma point is required to delete own questions') \
+                                                                            % min_karma
+            raise django_exceptions.PermissionDenied(msg)
+
         answer_count = question.thread.all_answers()\
-                        .exclude(author=self).exclude(score__lte=0).count()
+                        .exclude(author=self).exclude(points__lte=0).count()
 
         if answer_count > 0:
-            if self.is_administrator() or self.is_moderator():
-                return
-            else:
-                msg = ungettext(
-                    'Sorry, cannot delete your question since it '
-                    'has an upvoted answer posted by someone else',
-                    'Sorry, cannot delete your question since it '
-                    'has some upvoted answers posted by other users',
-                    answer_count
-                )
-                raise django_exceptions.PermissionDenied(msg)
+            msg = ungettext(
+                'Sorry, cannot delete this since it '
+                'has an upvoted response posted by someone else',
+                'Sorry, cannot delete this since it '
+                'has some upvoted responses posted by someone else',
+                answer_count
+            )
+            raise django_exceptions.PermissionDenied(msg)
 
 
 def user_assert_can_delete_answer(self, answer = None):
@@ -796,109 +1231,45 @@ def user_assert_can_delete_answer(self, answer = None):
     instead of "answer", because this logic also applies to
     assert on deleting question (in addition to some special rules)
     """
-    blocked_error_message = _(
-                'Sorry, since your account is blocked '
-                'you cannot delete posts'
-            )
-    suspended_error_message = _(
-                'Sorry, since your account is suspended '
-                'you can delete only your own posts'
-            )
-    low_rep_error_message = _(
-                'Sorry, to deleted other people\' posts, a minimum '
-                'reputation of %(min_rep)s is required'
-            ) % \
-            {'min_rep': askbot_settings.MIN_REP_TO_DELETE_OTHERS_POSTS}
     min_rep_setting = askbot_settings.MIN_REP_TO_DELETE_OTHERS_POSTS
 
     _assert_user_can(
-        user = self,
-        post = answer,
-        owner_can = True,
-        blocked_error_message = blocked_error_message,
-        suspended_error_message = suspended_error_message,
-        low_rep_error_message = low_rep_error_message,
-        min_rep_setting = min_rep_setting
+        user=self,
+        post=answer,
+        action_display=_('delete posts'),
+        owner_can=True,
+        blocked_user_cannot=True,
+        suspended_user_cannot=True,
+        min_rep_setting=min_rep_setting,
     )
 
 
 def user_assert_can_close_question(self, question = None):
     assert(getattr(question, 'post_type', '') == 'question')
-    blocked_error_message = _(
-                'Sorry, since your account is blocked '
-                'you cannot close questions'
-            )
-    suspended_error_message = _(
-                'Sorry, since your account is suspended '
-                'you cannot close questions'
-            )
-    low_rep_error_message = _(
-                'Sorry, to close other people\' posts, a minimum '
-                'reputation of %(min_rep)s is required'
-            ) % \
-            {'min_rep': askbot_settings.MIN_REP_TO_CLOSE_OTHERS_QUESTIONS}
     min_rep_setting = askbot_settings.MIN_REP_TO_CLOSE_OTHERS_QUESTIONS
-
-    owner_min_rep_setting =  askbot_settings.MIN_REP_TO_CLOSE_OWN_QUESTIONS
-
-    owner_low_rep_error_message = _(
-                        'Sorry, to close own question '
-                        'a minimum reputation of %(min_rep)s is required'
-                    ) % {'min_rep': owner_min_rep_setting}
-
     _assert_user_can(
-        user = self,
-        post = question,
-        owner_can = True,
-        suspended_owner_cannot = True,
-        owner_min_rep_setting = owner_min_rep_setting,
-        blocked_error_message = blocked_error_message,
-        suspended_error_message = suspended_error_message,
-        low_rep_error_message = low_rep_error_message,
-        owner_low_rep_error_message = owner_low_rep_error_message,
-        min_rep_setting = min_rep_setting
+        user=self,
+        post=question,
+        action_display=askbot_settings.WORDS_CLOSE_QUESTIONS,
+        owner_can=True,
+        suspended_owner_cannot=True,
+        blocked_user_cannot=True,
+        suspended_user_cannot=True,
+        min_rep_setting=min_rep_setting,
     )
 
 
 def user_assert_can_reopen_question(self, question = None):
     assert(question.post_type == 'question')
-
-    #for some reason rep to reopen own questions != rep to close own q's
-    owner_min_rep_setting =  askbot_settings.MIN_REP_TO_REOPEN_OWN_QUESTIONS
-    min_rep_setting = askbot_settings.MIN_REP_TO_CLOSE_OTHERS_QUESTIONS
-
-    general_error_message = _(
-                        'Sorry, only administrators, moderators '
-                        'or post owners with reputation > %(min_rep)s '
-                        'can reopen questions.'
-                    ) % {'min_rep': owner_min_rep_setting }
-
-    owner_low_rep_error_message = _(
-                        'Sorry, to reopen own question '
-                        'a minimum reputation of %(min_rep)s is required'
-                    ) % {'min_rep': owner_min_rep_setting}
-
-    blocked_error_message = _(
-            'Sorry, you cannot reopen questions '
-            'because your account is blocked'
-        )
-
-    suspended_error_message = _(
-            'Sorry, you cannot reopen questions '
-            'because your account is suspended'
-        )
-
     _assert_user_can(
-        user = self,
-        post = question,
-        owner_can = True,
-        suspended_owner_cannot = True,
-        owner_min_rep_setting = owner_min_rep_setting,
-        min_rep_setting = min_rep_setting,
-        owner_low_rep_error_message = owner_low_rep_error_message,
-        general_error_message = general_error_message,
-        blocked_error_message = blocked_error_message,
-        suspended_error_message = suspended_error_message
+        user=self,
+        post=question,
+        action_display=_('reopen questions'),
+        suspended_owner_cannot=True,
+        #for some reason rep to reopen own questions != rep to close own q's
+        min_rep_setting=askbot_settings.MIN_REP_TO_CLOSE_OTHERS_QUESTIONS,
+        blocked_user_cannot=True,
+        suspended_user_cannot=True,
     )
 
 
@@ -907,37 +1278,21 @@ def user_assert_can_flag_offensive(self, post = None):
     assert(post is not None)
 
     double_flagging_error_message = _(
-        'You have flagged this question before and '
+        'You have flagged this post before and '
         'cannot do it more than once'
     )
 
     if self.get_flags_for_post(post).count() > 0:
         raise askbot_exceptions.DuplicateCommand(double_flagging_error_message)
 
-    blocked_error_message = _(
-        'Sorry, since your account is blocked '
-        'you cannot flag posts as offensive'
-    )
-
-    suspended_error_message = _(
-        'Sorry, your account appears to be suspended and you cannot make new posts '
-        'until this issue is resolved. You can, however edit your existing posts. '
-        'Please contact the forum administrator to reach a resolution.'
-    )
-
-    low_rep_error_message = _(
-        'Sorry, to flag posts as offensive a minimum reputation '
-        'of %(min_rep)s is required'
-    ) % \
-                        {'min_rep': askbot_settings.MIN_REP_TO_FLAG_OFFENSIVE}
     min_rep_setting = askbot_settings.MIN_REP_TO_FLAG_OFFENSIVE
 
     _assert_user_can(
         user = self,
         post = post,
-        blocked_error_message = blocked_error_message,
-        suspended_error_message = suspended_error_message,
-        low_rep_error_message = low_rep_error_message,
+        action_display=_('flag posts as offensive'),
+        blocked_user_cannot=True,
+        suspended_user_cannot=True,
         min_rep_setting = min_rep_setting
     )
     #one extra assertion
@@ -955,8 +1310,18 @@ def user_assert_can_flag_offensive(self, post = None):
                 }
             raise django_exceptions.PermissionDenied(flags_exceeded_error_message)
 
-def user_assert_can_remove_flag_offensive(self, post = None):
 
+def user_assert_can_follow_question(self, question=None):
+    _assert_user_can(
+        user=self,
+        post=question, #related post (may be parent)
+        owner_can=True,
+        action_display=askbot_settings.WORDS_FOLLOW_QUESTIONS,
+        blocked_user_cannot=True
+    )
+
+
+def user_assert_can_remove_flag_offensive(self, post=None):
     assert(post is not None)
 
     non_existing_flagging_error_message = _('cannot remove non-existing flag')
@@ -964,33 +1329,16 @@ def user_assert_can_remove_flag_offensive(self, post = None):
     if self.get_flags_for_post(post).count() < 1:
         raise django_exceptions.PermissionDenied(non_existing_flagging_error_message)
 
-    blocked_error_message = _(
-        'Sorry, since your account is blocked you cannot remove flags'
-    )
-
-    suspended_error_message = _(
-        'Sorry, your account appears to be suspended and you cannot remove flags. '
-        'Please contact the forum administrator to reach a resolution.'
-    )
-
     min_rep_setting = askbot_settings.MIN_REP_TO_FLAG_OFFENSIVE
-    low_rep_error_message = ungettext(
-        'Sorry, to flag posts a minimum reputation of %(min_rep)d is required',
-        'Sorry, to flag posts a minimum reputation of %(min_rep)d is required',
-        min_rep_setting
-    ) % {'min_rep': min_rep_setting}
-
     _assert_user_can(
-        user = self,
-        post = post,
-        blocked_error_message = blocked_error_message,
-        suspended_error_message = suspended_error_message,
-        low_rep_error_message = low_rep_error_message,
-        min_rep_setting = min_rep_setting
+        user=self,
+        post=post,
+        action_display=_('remove flags'),
+        blocked_user_cannot=True,
+        suspended_user_cannot=True,
+        min_rep_setting=min_rep_setting
     )
-    #one extra assertion
-    if self.is_administrator() or self.is_moderator():
-        return
+
 
 def user_assert_can_remove_all_flags_offensive(self, post = None):
     assert(post is not None)
@@ -1015,78 +1363,86 @@ def user_assert_can_remove_all_flags_offensive(self, post = None):
 def user_assert_can_retag_question(self, question = None):
 
     if question.deleted == True:
-        try:
-            self.assert_can_edit_deleted_post(question)
-        except django_exceptions.PermissionDenied:
-            error_message = _(
-                            'Sorry, only question owners, '
-                            'site administrators and moderators '
-                            'can retag deleted questions'
-                        )
-            raise django_exceptions.PermissionDenied(error_message)
-
-    blocked_error_message = _(
-                'Sorry, since your account is blocked '
-                'you cannot retag questions'
-            )
-    suspended_error_message = _(
-                'Sorry, since your account is suspended '
-                'you can retag only your own questions'
-            )
-    low_rep_error_message = _(
-                'Sorry, to retag questions a minimum '
-                'reputation of %(min_rep)s is required'
-            ) % \
-            {'min_rep': askbot_settings.MIN_REP_TO_RETAG_OTHERS_QUESTIONS}
-    min_rep_setting = askbot_settings.MIN_REP_TO_RETAG_OTHERS_QUESTIONS
+        self.assert_can_edit_deleted_post(question)
 
     _assert_user_can(
-        user = self,
-        post = question,
-        owner_can = True,
-        blocked_error_message = blocked_error_message,
-        suspended_error_message = suspended_error_message,
-        low_rep_error_message = low_rep_error_message,
-        min_rep_setting = min_rep_setting
+        user=self,
+        post=question,
+        action_display=askbot_settings.WORDS_RETAG_QUESTIONS,
+        owner_can=True,
+        blocked_user_cannot=True,
+        suspended_user_cannot=True,
+        min_rep_setting=askbot_settings.MIN_REP_TO_RETAG_OTHERS_QUESTIONS
     )
 
 
 def user_assert_can_delete_comment(self, comment = None):
-    blocked_error_message = _(
-                'Sorry, since your account is blocked '
-                'you cannot delete comment'
-            )
-    suspended_error_message = _(
-                'Sorry, since your account is suspended '
-                'you can delete only your own comments'
-            )
-    low_rep_error_message = _(
-                'Sorry, to delete comments '
-                'reputation of %(min_rep)s is required'
-            ) % \
-            {'min_rep': askbot_settings.MIN_REP_TO_DELETE_OTHERS_COMMENTS}
     min_rep_setting = askbot_settings.MIN_REP_TO_DELETE_OTHERS_COMMENTS
 
     _assert_user_can(
         user = self,
         post = comment,
+        action_display=_('delete comments'),
         owner_can = True,
-        blocked_error_message = blocked_error_message,
-        suspended_error_message = suspended_error_message,
-        low_rep_error_message = low_rep_error_message,
-        min_rep_setting = min_rep_setting
+        blocked_user_cannot=True,
+        suspended_user_cannot=True,
+        min_rep_setting = min_rep_setting,
     )
+
+    if self.is_administrator_or_moderator():
+        return
+
+    if comment.author_id == self.pk:
+        if askbot_settings.USE_TIME_LIMIT_TO_EDIT_COMMENT:
+            now = timezone.now()
+            delta_seconds = 60 * askbot_settings.MINUTES_TO_EDIT_COMMENT
+            if now - comment.added_at > datetime.timedelta(0, delta_seconds):
+                if not comment.is_last():
+                    error_message = ungettext(
+                        'Sorry, comments (except the last one) are deletable only '
+                        'within %(minutes)s minute from posting',
+                        'Sorry, comments (except the last one) are deletable only '
+                        'within %(minutes)s minutes from posting',
+                        askbot_settings.MINUTES_TO_EDIT_COMMENT
+                    ) % {'minutes': askbot_settings.MINUTES_TO_EDIT_COMMENT}
+                    raise django_exceptions.PermissionDenied(error_message)
 
 
 def user_assert_can_revoke_old_vote(self, vote):
     """raises exceptions.PermissionDenied if old vote
     cannot be revoked due to age of the vote
     """
-    if (datetime.datetime.now().day - vote.voted_at.day) \
+    if askbot_settings.MAX_DAYS_TO_CANCEL_VOTE <= 0:
+        return
+    if (timezone.now() - vote.voted_at).days \
         >= askbot_settings.MAX_DAYS_TO_CANCEL_VOTE:
         raise django_exceptions.PermissionDenied(
             _('sorry, but older votes cannot be revoked')
         )
+
+
+def user_get_localized_profile(self):
+    lang = get_language()
+    key = get_localized_profile_cache_key(self, lang)
+    profile = cache.get(key)
+    if not profile:
+        kwargs = {
+            'language_code': lang,
+            'auth_user': self
+        }
+        profile = LocalizedUserProfile.objects.get_or_create(**kwargs)[0]
+        profile.update_cache()
+    return profile
+
+
+def user_update_localized_profile(self, **kwargs):
+    profile = self.get_localized_profile()
+    for key, val in kwargs.items():
+        setattr(profile, key, val)
+    profile.update_cache()
+    lp = LocalizedUserProfile.objects.filter(pk=profile.pk)
+    lp.update(**kwargs)
+
 
 def user_get_unused_votes_today(self):
     """returns number of votes that are
@@ -1103,12 +1459,14 @@ def user_get_unused_votes_today(self):
     available_votes = askbot_settings.MAX_VOTES_PER_USER_PER_DAY - used_votes
     return max(0, available_votes)
 
+@reject_forbidden_phrases
 def user_post_comment(
                     self,
-                    parent_post = None,
-                    body_text = None,
-                    timestamp = None,
-                    by_email = False
+                    parent_post=None,
+                    body_text=None,
+                    timestamp=None,
+                    by_email=False,
+                    ip_addr=None,
                 ):
     """post a comment on behalf of the user
     to parent_post
@@ -1119,41 +1477,42 @@ def user_post_comment(
     if parent_post is None:
         raise ValueError('parent_post is required to post comment')
     if timestamp is None:
-        timestamp = datetime.datetime.now()
+        timestamp = timezone.now()
 
-    self.assert_can_post_comment(parent_post = parent_post)
+    self.assert_can_post_comment(parent_post=parent_post)
 
     comment = parent_post.add_comment(
-                    user = self,
-                    comment = body_text,
-                    added_at = timestamp,
-                    by_email = by_email
+                    user=self,
+                    comment=body_text,
+                    added_at=timestamp,
+                    by_email=by_email,
+                    ip_addr=ip_addr,
                 )
-    parent_post.thread.invalidate_cached_data()
-    award_badges_signal.send(
-        None,
-        event = 'post_comment',
-        actor = self,
-        context_object = comment,
-        timestamp = timestamp
-    )
+    comment.add_to_groups([self.get_personal_group()])
+
+    parent_post.thread.reset_cached_data()
+    award_badges_signal.send(None,
+                             event='post_comment',
+                             actor=self,
+                             context_object=comment,
+                             timestamp=timestamp)
     return comment
 
-def user_post_tag_wiki(
+def user_post_object_description(
                     self,
-                    tag = None,
-                    body_text = None,
-                    timestamp = None
+                    obj=None,
+                    body_text=None,
+                    timestamp=None
                 ):
-    """Creates a tag wiki post and assigns it
-    to the given tag. Returns the newly created post"""
-    tag_wiki_post = Post.objects.create_new_tag_wiki(
-                                            author = self,
-                                            text = body_text
+    """Creates an object description post and assigns it
+    to the given object. Returns the newly created post"""
+    description_post = Post.objects.create_new_tag_wiki(
+                                            author=self,
+                                            text=body_text
                                         )
-    tag.tag_wiki = tag_wiki_post
-    tag.save()
-    return tag_wiki_post
+    obj.description = description_post
+    obj.save()
+    return description_post
 
 
 def user_post_anonymous_askbot_content(user, session_key):
@@ -1162,29 +1521,15 @@ def user_post_anonymous_askbot_content(user, session_key):
 
     this function is used by the signal handler with a similar name
     """
-    aq_list = AnonymousQuestion.objects.filter(session_key = session_key)
-    aa_list = AnonymousAnswer.objects.filter(session_key = session_key)
-    #from askbot.conf import settings as askbot_settings
-    if askbot_settings.EMAIL_VALIDATION == True:#add user to the record
-        for aq in aq_list:
-            aq.author = user
-            aq.save()
-        for aa in aa_list:
-            aa.author = user
-            aa.save()
-        #maybe add pending posts message?
-    else:
-        if user.is_blocked():
-            msg = get_i18n_message('BLOCKED_USERS_CANNOT_POST')
-            user.message_set.create(message = msg)
-        elif user.is_suspended():
-            msg = get_i18n_message('SUSPENDED_USERS_CANNOT_POST')
-            user.message_set.create(message = msg)
-        else:
-            for aq in aq_list:
-                aq.publish(user)
-            for aa in aa_list:
-                aa.publish(user)
+    is_on_read_only_group = user.get_groups().filter(read_only=True).count()
+    if askbot_settings.READ_ONLY_MODE_ENABLED or is_on_read_only_group:
+        user.message_set.create(message = _('Sorry, but you have only read access'))
+        return
+
+    for aq in AnonymousQuestion.objects.filter(session_key=session_key):
+        aq.publish(user)
+    for aa in AnonymousAnswer.objects.filter(session_key=session_key):
+        aa.publish(user)
 
 
 def user_mark_tags(
@@ -1201,6 +1546,8 @@ def user_mark_tags(
     * ``reason`` - either "good" or "bad"
     * ``action`` - eitrer "add" or "remove"
     """
+    self.assert_can_mark_tags()
+
     cleaned_wildcards = list()
     assert(action in ('add', 'remove'))
     if action == 'add':
@@ -1217,10 +1564,28 @@ def user_mark_tags(
     if tagnames is None:
         tagnames = list()
 
+    #figure out which tags don't yet exist
+    language_code = get_language()
+    existing_tagnames = Tag.objects.filter(
+                            name__in=tagnames,
+                            language_code=language_code
+                        ).values_list(
+                            'name', flat=True
+                        )
+    non_existing_tagnames = set(tagnames) - set(existing_tagnames)
+    #create those tags, and if tags are moderated make them suggested
+    if (len(non_existing_tagnames) > 0):
+        Tag.objects.create_in_bulk(
+                        tag_names=tagnames,
+                        user=self,
+                        language_code=language_code
+                    )
+
     #below we update normal tag selections
     marked_ts = MarkedTag.objects.filter(
                                     user = self,
-                                    tag__name__in = tagnames
+                                    tag__name__in=tagnames,
+                                    tag__language_code=language_code
                                 )
     #Marks for "good" and "bad" reasons are exclusive,
     #to make it impossible to "like" and "dislike" something at the same time
@@ -1242,7 +1607,10 @@ def user_mark_tags(
         marked_names = marked_ts.values_list('tag__name', flat = True)
         if len(marked_names) < len(tagnames):
             unmarked_names = set(tagnames).difference(set(marked_names))
-            ts = Tag.objects.filter(name__in = unmarked_names)
+            ts = Tag.objects.filter(
+                            name__in=unmarked_names,
+                            language_code=language_code
+                        )
             new_marks = list()
             for tag in ts:
                 MarkedTag(
@@ -1260,6 +1628,67 @@ def user_mark_tags(
 
     return cleaned_tagnames, cleaned_wildcards
 
+def user_merge_duplicate_questions(self, from_q, to_q):
+    """merges content from the ``from_thread`` to the ``to-thread``"""
+    #todo: maybe assertion will depend on which questions are merged
+    self.assert_can_merge_questions()
+    to_q.merge_post(from_q, user=self)
+    from_thread = from_q.thread
+    to_thread = to_q.thread
+    #set new thread value to all posts
+    posts = from_thread.posts.all()
+    posts.update(thread=to_thread)
+
+    if askbot_settings.LIMIT_ONE_ANSWER_PER_USER:
+        #merge answers if only one is allowed per user
+        answers = to_thread.all_answers()
+        answer_map = collections.defaultdict(list)
+        #compile all answers by user
+        for answer in answers:
+            author = answer.author
+            answer_map[author].append(answer)
+
+        for author in answer_map:
+            author_answers = answer_map[author]
+            if author_answers > 1:
+                first_answer = author_answers.pop(0)
+                for answer in author_answers:
+                    first_answer.merge_post(answer, user=self)
+
+    #from_thread.spaces.clear()
+    from_thread.delete()
+    to_thread.answer_count = to_thread.get_answers().count()
+    to_thread.last_activity_by = self
+    to_thread.last_activity_at = timezone.now()
+    to_thread.save()
+    to_thread.reset_cached_data()
+
+
+def user_recount_badges(self):
+    bronze, silver, gold = 0, 0, 0
+
+    awards = Award.objects.filter(
+                            user=self
+                        ).annotate(
+                            count=Count('badge')
+                        )
+    for award in awards:
+        badge = award.badge
+        if badge.is_enabled():
+            level = badge.get_level()
+            if level == const.BRONZE_BADGE:
+                bronze += award.count
+            elif level == const.SILVER_BADGE:
+                silver += award.count
+            elif level == const.GOLD_BADGE:
+                gold += award.count
+
+    self.bronze = bronze
+    self.silver = silver
+    self.gold = gold
+    self.save()
+
+
 @auto_now_timestamp
 def user_retag_question(
                     self,
@@ -1275,53 +1704,84 @@ def user_retag_question(
         tagnames = tags,
         silent = silent
     )
-    question.thread.invalidate_cached_data()
+    question.thread.reset_cached_data()
     award_badges_signal.send(None,
-        event = 'retag_question',
-        actor = self,
-        context_object = question,
-        timestamp = timestamp
-    )
+                             event='retag_question',
+                             actor=self,
+                             context_object=question,
+                             timestamp=timestamp)
+
+
+def user_repost_comment_as_answer(self, comment):
+    """converts comment to answer under the
+    parent question"""
+
+    #todo: add assertion
+    self.assert_can_convert_post(comment)
+
+    comment.post_type = 'answer'
+    old_parent = comment.parent
+
+    comment.parent = comment.thread._question_post()
+    comment.parse_and_save(author=self)
+
+    comment.thread.update_answer_count()
+
+    comment.parent.comment_count += 1
+    comment.parent.save()
+
+    #to avoid db constraint error
+    if old_parent.comment_count >= 1:
+        old_parent.comment_count -= 1
+    else:
+        old_parent.comment_count = 0
+
+    old_parent.save()
+    comment.thread.reset_cached_data()
 
 @auto_now_timestamp
 def user_accept_best_answer(
-                self, answer = None,
-                timestamp = None,
-                cancel = False,
-                force = False
+                self, answer=None,
+                timestamp=None,
+                cancel=False,
+                force=False
             ):
     if cancel:
         return self.unaccept_best_answer(
-                                answer = answer,
-                                timestamp = timestamp,
-                                force = force
+                                answer=answer,
+                                timestamp=timestamp,
+                                force=force
                             )
     if force == False:
         self.assert_can_accept_best_answer(answer)
-    if answer.accepted() == True:
+    if answer.endorsed:
         return
 
-    prev_accepted_answer = answer.thread.accepted_answer
-    if prev_accepted_answer:
-        auth.onAnswerAcceptCanceled(prev_accepted_answer, self)
+    #todo: optionally allow accepting >1 answer
+    #but for now only one
+    prev_accepted_answers = answer.thread.posts.filter(
+                                        post_type='answer',
+                                        endorsed=True
+                                    )
+    for accepted_answer in prev_accepted_answers:
+        auth.onAnswerAcceptCanceled(accepted_answer, self)
 
-    auth.onAnswerAccept(answer, self, timestamp = timestamp)
+    auth.onAnswerAccept(answer, self, timestamp=timestamp)
     award_badges_signal.send(None,
-        event = 'accept_best_answer',
-        actor = self,
-        context_object = answer,
-        timestamp = timestamp
-    )
+                             event='accept_best_answer',
+                             actor=self,
+                             context_object=answer,
+                             timestamp=timestamp)
 
 @auto_now_timestamp
 def user_unaccept_best_answer(
-                self, answer = None,
-                timestamp = None,
-                force = False
+                self, answer=None,
+                timestamp=None,
+                force=False
             ):
     if force == False:
         self.assert_can_unaccept_best_answer(answer)
-    if not answer.accepted():
+    if not answer.endorsed:
         return
     auth.onAnswerAcceptCanceled(answer, self)
 
@@ -1338,7 +1798,7 @@ def user_delete_comment(
     #comment.deleted_at = timestamp
     #comment.save()
     comment.delete()
-    comment.thread.invalidate_cached_data()
+    comment.thread.reset_cached_data()
 
 @auto_now_timestamp
 def user_delete_answer(
@@ -1350,23 +1810,30 @@ def user_delete_answer(
     answer.deleted = True
     answer.deleted_by = self
     answer.deleted_at = timestamp
+
+    if answer.endorsed and answer.thread.accepted_answer == answer:
+        #forget about the accepted answer,
+        #but do not erase the "endorsement" info on
+        #the answer post itself, to allow restoring
+        answer.thread.accepted_answer = None
+
     answer.save()
 
     answer.thread.update_answer_count()
-    answer.thread.invalidate_cached_data()
+    answer.thread.update_last_activity_info()
+    answer.thread.reset_cached_data()
     logging.debug('updated answer count to %d' % answer.thread.answer_count)
 
-    signals.delete_question_or_answer.send(
-        sender = answer.__class__,
-        instance = answer,
-        delete_by = self
+    signals.after_post_removed.send(
+        sender=answer.__class__,
+        instance=answer,
+        deleted_by=self
     )
     award_badges_signal.send(None,
-                event = 'delete_post',
-                actor = self,
-                context_object = answer,
-                timestamp = timestamp
-            )
+                             event='delete_post',
+                             actor=self,
+                             context_object=answer,
+                             timestamp=timestamp)
 
 
 @auto_now_timestamp
@@ -1382,26 +1849,82 @@ def user_delete_question(
     question.deleted_at = timestamp
     question.save()
 
+    question.thread.deleted = True
+    question.thread.save()
+
     for tag in list(question.thread.tags.all()):
-        if tag.used_count == 1:
+        if tag.used_count <= 1:
+            tag.used_count = 0
             tag.deleted = True
             tag.deleted_by = self
             tag.deleted_at = timestamp
         else:
-            tag.used_count = tag.used_count - 1
+            tag.decrement_used_count()
         tag.save()
 
-    signals.delete_question_or_answer.send(
+    signals.after_post_removed.send(
         sender = question.__class__,
         instance = question,
-        delete_by = self
+        deleted_by = self
     )
     award_badges_signal.send(None,
-                event = 'delete_post',
-                actor = self,
-                context_object = question,
-                timestamp = timestamp
-            )
+                             event='delete_post',
+                             actor=self,
+                             context_object=question,
+                             timestamp=timestamp)
+
+
+def user_delete_all_content_authored_by_user(self,
+                                             author,
+                                             timestamp=None,
+                                             submit_spam=False):
+    """Deletes all questions, answers and comments made by the user"""
+    count = 0
+
+    #delete answers
+    answers = Post.objects.get_answers().filter(author=author, deleted=False)
+    timestamp = timestamp or timezone.now()
+    count += answers.update(deleted_at=timestamp, deleted_by=self, deleted=True)
+    post_ids = list(answers.values_list('pk', flat=True))
+
+    #delete questions
+    questions = Post.objects.get_questions().filter(author=author, deleted=False)
+    count += questions.count()
+    for question in questions:
+        self.delete_question(question=question, timestamp=timestamp)
+        post_ids.append(question.pk)
+
+    threads = Thread.objects.filter(last_activity_by=author)
+    for thread in threads:
+        thread.update_last_activity_info()
+
+    #delete threads
+    thread_ids = questions.values_list('thread_id', flat=True)
+    #load second time b/c threads above are not quite real
+    threads = Thread.objects.filter(id__in=thread_ids)
+    threads.update(deleted=True)
+    for thread in threads:
+        thread.reset_cached_data()
+
+    # delete comments
+    # todo: switch to marking comments as deleted
+    comments = Post.objects.get_comments().filter(author=author)
+    count += comments.count()
+    comments.delete()
+
+    if submit_spam:
+        from askbot.tasks import submit_spam_posts
+        defer_celery_task(submit_spam_posts, args=(post_ids,))
+
+    #delete all unused tags created by this user
+    #tags = author.created_tags.all()
+    #tag_ids = list()
+    #for tag in tags:
+    #    if tag.used_count == 0:
+    #        tag_ids.append(tag.id)
+    #Tag.objects.filter(id__in=tag_ids).delete()
+
+    return count
 
 
 @auto_now_timestamp
@@ -1441,7 +1964,7 @@ def user_delete_post(
         self.delete_question(question = post, timestamp = timestamp)
     else:
         raise TypeError('either Comment, Question or Answer expected')
-    post.thread.invalidate_cached_data()
+    post.thread.reset_cached_data()
 
 def user_restore_post(
                     self,
@@ -1455,9 +1978,15 @@ def user_restore_post(
         post.deleted_by = None
         post.deleted_at = None
         post.save()
-        post.thread.invalidate_cached_data()
+        if post.post_type == 'question':
+            post.thread.deleted = False
+            post.thread.save()
+        post.thread.reset_cached_data()
         if post.post_type == 'answer':
+            if post.endorsed and post.thread.accepted_answer == None:
+                post.thread.accepted_answer = post
             post.thread.update_answer_count()
+            post.thread.update_last_activity_info()
         else:
             #todo: make sure that these tags actually exist
             #some may have since been deleted for good
@@ -1468,19 +1997,29 @@ def user_restore_post(
                     tag.deleted_by = None
                     tag.deleted_at = None
                     tag.save()
+        signals.after_post_restored.send(
+            sender=post.__class__,
+            instance=post,
+            restored_by=self,
+        )
     else:
         raise NotImplementedError()
 
+@reject_forbidden_phrases
 def user_post_question(
                     self,
-                    title = None,
-                    body_text = '',
-                    tags = None,
-                    wiki = False,
-                    is_anonymous = False,
-                    timestamp = None,
-                    by_email = False,
-                    email_address = None
+                    title=None,
+                    body_text='',
+                    tags=None, # string of space-separated tags
+                    wiki=False,
+                    is_anonymous=False,
+                    is_private=False,
+                    group_id=None,
+                    timestamp=None,
+                    by_email=False,
+                    email_address=None,
+                    language=None,
+                    ip_addr=None,
                 ):
     """makes an assertion whether user can post the question
     then posts it and returns the question object"""
@@ -1495,35 +2034,53 @@ def user_post_question(
     if tags is None:
         raise ValueError('Tags are required to post question')
     if timestamp is None:
-        timestamp = datetime.datetime.now()
+        timestamp = timezone.now()
 
-    #todo: split this into "create thread" + "add queston", if text exists
+    #todo: split this into "create thread" + "add question", if text exists
     #or maybe just add a blank question post anyway
     thread = Thread.objects.create_new(
-                                    author = self,
-                                    title = title,
-                                    text = body_text,
-                                    tagnames = tags,
-                                    added_at = timestamp,
-                                    wiki = wiki,
-                                    is_anonymous = is_anonymous,
-                                    by_email = by_email,
-                                    email_address = email_address
+                                    author=self,
+                                    title=title,
+                                    text=body_text,
+                                    tagnames=tags,
+                                    added_at=timestamp,
+                                    wiki=wiki,
+                                    is_anonymous=is_anonymous,
+                                    is_private=is_private,
+                                    group_id=group_id,
+                                    by_email=by_email,
+                                    email_address=email_address,
+                                    language=language,
+                                    ip_addr=ip_addr
                                 )
+    thread.reset_cached_data()
     question = thread._question_post()
     if question.author != self:
         raise ValueError('question.author != self')
     question.author = self # HACK: Some tests require that question.author IS exactly the same object as self-user (kind of identity map which Django doesn't provide),
                            #       because they set some attributes for that instance and expect them to be changed also for question.author
+
+    if askbot_settings.AUTO_FOLLOW_QUESTION_BY_OP:
+        self.toggle_favorite_question(question)
+
+    award_badges_signal.send(None,
+                             event='post_question',
+                             actor=self,
+                             context_object=question,
+                             timestamp=timestamp)
+
     return question
 
 @auto_now_timestamp
+@reject_forbidden_phrases
 def user_edit_comment(
                     self,
                     comment_post=None,
-                    body_text = None,
-                    timestamp = None,
-                    by_email = False
+                    body_text=None,
+                    timestamp=None,
+                    by_email=False,
+                    suppress_email=False,
+                    ip_addr=None,
                 ):
     """apply edit to a comment, the method does not
     change the comments timestamp and no signals are sent
@@ -1531,128 +2088,192 @@ def user_edit_comment(
     todo: add timestamp
     """
     self.assert_can_edit_comment(comment_post)
-    comment_post.apply_edit(
-                        text = body_text,
-                        edited_at = timestamp,
-                        edited_by = self,
-                        by_email = by_email
+    revision = comment_post.apply_edit(
+                        text=body_text,
+                        edited_at=timestamp,
+                        edited_by=self,
+                        by_email=by_email,
+                        suppress_email=suppress_email,
+                        ip_addr=ip_addr,
                     )
-    comment_post.thread.invalidate_cached_data()
+    comment_post.thread.reset_cached_data()
+    return revision
 
 def user_edit_post(self,
-                post = None,
-                body_text = None,
-                revision_comment = None,
-                timestamp = None,
-                by_email = False
-            ):
-    """a simple method that edits post body
-    todo: unify it in the style of just a generic post
+                   post=None,
+                   body_text=None,
+                   revision_comment=None,
+                   timestamp=None,
+                   by_email=False,
+                   is_private=False,
+                   suppress_email=False,
+                   ip_addr=None):
+    """Edits post body.
+    Todo: unify it in the style of just a generic post
     this requires refactoring of underlying functions
-    because we cannot bypass the permissions checks set within
-    """
+    because we cannot bypass the permissions checks set within."""
     if post.post_type == 'comment':
-        self.edit_comment(
-                comment_post = post,
-                body_text = body_text,
-                by_email = by_email
-            )
+        return self.edit_comment(comment_post=post,
+							body_text=body_text,
+							by_email=by_email,
+							suppress_email=suppress_email,
+							ip_addr=ip_addr)
     elif post.post_type == 'answer':
-        self.edit_answer(
-            answer = post,
-            body_text = body_text,
-            timestamp = timestamp,
-            revision_comment = revision_comment,
-            by_email = by_email
+        return self.edit_answer(
+            answer=post,
+            body_text=body_text,
+            timestamp=timestamp,
+            revision_comment=revision_comment,
+            by_email=by_email,
+            suppress_email=suppress_email,
+            ip_addr=ip_addr
         )
     elif post.post_type == 'question':
-        self.edit_question(
-            question = post,
-            body_text = body_text,
-            timestamp = timestamp,
-            revision_comment = revision_comment,
-            by_email = by_email
+        return self.edit_question(
+            question=post,
+            body_text=body_text,
+            timestamp=timestamp,
+            revision_comment=revision_comment,
+            by_email=by_email,
+            is_private=is_private,
+            suppress_email=suppress_email,
+            ip_addr=ip_addr
         )
     elif post.post_type == 'tag_wiki':
-        post.apply_edit(
-            edited_at = timestamp,
-            edited_by = self,
-            text = body_text,
+        return post.apply_edit(
+            edited_at=timestamp,
+            edited_by=self,
+            text=body_text,
             #todo: summary name clash in question and question revision
-            comment = revision_comment,
-            wiki = True,
-            by_email = False
+            comment=revision_comment,
+            wiki=True,
+            by_email=False,
+            ip_addr=ip_addr,
         )
     else:
         raise NotImplementedError()
 
 @auto_now_timestamp
+@reject_forbidden_phrases
 def user_edit_question(
                 self,
-                question = None,
-                title = None,
-                body_text = None,
-                revision_comment = None,
-                tags = None,
-                wiki = False,
-                edit_anonymously = False,
-                timestamp = None,
-                force = False,#if True - bypass the assert
-                by_email = False
+                question=None,
+                title=None,
+                body_text=None,
+                revision_comment=None,
+                tags=None, # string of space-separated tags
+                wiki=False,
+                edit_anonymously=False,
+                is_private=False,
+                timestamp=None,
+                force=False,#if True - bypass the assert
+                by_email=False,
+                suppress_email=False,
+                ip_addr=None,
             ):
     if force == False:
         self.assert_can_edit_question(question)
 
-    question.apply_edit(
-        edited_at = timestamp,
-        edited_by = self,
-        title = title,
-        text = body_text,
+    ##it is important to do this before __apply_edit b/c of signals!!!
+    if question.is_private() != is_private:
+        if is_private:
+            #todo: make private for author or for the editor?
+            question.thread.make_private(question.author)
+        else:
+            question.thread.make_public(recursive=False)
+
+    latest_revision = question.get_latest_revision()
+    #a hack to allow partial edits - important for SE loader
+    if title is None:
+        title = question.thread.title
+    if tags is None:
+        tags = latest_revision.tagnames
+
+    #revision has title and tags as well
+    revision = question.apply_edit(
+        edited_at=timestamp,
+        edited_by=self,
+        text=body_text,
         #todo: summary name clash in question and question revision
-        comment = revision_comment,
-        tags = tags,
-        wiki = wiki,
-        edit_anonymously = edit_anonymously,
-        by_email = by_email
+        comment=revision_comment,
+        wiki=wiki,
+        edit_anonymously=edit_anonymously,
+        is_private=is_private,
+        by_email=by_email,
+        suppress_email=suppress_email,
+        ip_addr=ip_addr
     )
 
-    question.thread.invalidate_cached_data()
+    # Update the Question tag associations
+    if latest_revision.tagnames != tags:
+        question.thread.update_tags(
+            tagnames=tags, user=self, timestamp=timestamp
+        )
+
+    question.thread.title = title
+    question.thread.tagnames = tags
+    question.thread.set_last_activity_info(
+        last_activity_at=timestamp,
+        last_activity_by=self
+    )
+    question.thread.save()
+    question.thread.reset_cached_data()
 
     award_badges_signal.send(None,
-        event = 'edit_question',
-        actor = self,
-        context_object = question,
-        timestamp = timestamp
-    )
+                             event='edit_question',
+                             actor=self,
+                             context_object=question,
+                             timestamp=timestamp)
+    return revision
 
 @auto_now_timestamp
+@reject_forbidden_phrases
 def user_edit_answer(
                     self,
-                    answer = None,
-                    body_text = None,
-                    revision_comment = None,
-                    wiki = False,
-                    timestamp = None,
-                    force = False,#if True - bypass the assert
-                    by_email = False
+                    answer=None,
+                    body_text=None,
+                    revision_comment=None,
+                    wiki=False,
+                    is_private=False,
+                    timestamp=None,
+                    force=False,#if True - bypass the assert
+                    by_email=False,
+                    suppress_email=False,
+                    ip_addr=None,
                 ):
+
     if force == False:
         self.assert_can_edit_answer(answer)
-    answer.apply_edit(
-        edited_at = timestamp,
-        edited_by = self,
-        text = body_text,
-        comment = revision_comment,
-        wiki = wiki,
-        by_email = by_email
+
+    if answer.is_private() != is_private:
+        if is_private:
+            answer.make_private(answer.author)
+        else:
+            answer.make_public()
+
+    revision = answer.apply_edit(edited_at=timestamp,
+                                 edited_by=self,
+                                 text=body_text,
+                                 comment=revision_comment,
+                                 wiki=wiki,
+                                 is_private=is_private,
+                                 by_email=by_email,
+                                 suppress_email=suppress_email,
+                                 ip_addr=ip_addr)
+
+    answer.thread.set_last_activity_info(
+        last_activity_at=timestamp,
+        last_activity_by=self
     )
-    answer.thread.invalidate_cached_data()
+    answer.thread.save()
+    answer.thread.reset_cached_data()
+
     award_badges_signal.send(None,
-        event = 'edit_answer',
-        actor = self,
-        context_object = answer,
-        timestamp = timestamp
-    )
+                             event='edit_answer',
+                             actor=self,
+                             context_object=answer,
+                             timestamp=timestamp)
+    return revision
 
 @auto_now_timestamp
 def user_create_post_reject_reason(
@@ -1672,12 +2293,12 @@ def user_create_post_reject_reason(
         added_at = timestamp,
         text = details
     )
-    details.parse_and_save(author = self)
+    details.parse_and_save(author=self)
     details.add_revision(
         author = self,
         revised_at = timestamp,
         text = details,
-        comment = const.POST_STATUS['default_version']
+        comment = unicode(const.POST_STATUS['default_version'])
     )
 
     reason.details = details
@@ -1685,35 +2306,33 @@ def user_create_post_reject_reason(
     return reason
 
 @auto_now_timestamp
-def user_edit_post_reject_reason(
-    self, reason, title = None, details = None, timestamp = None
-):
+def user_edit_post_reject_reason(self, reason, title=None,
+                                 details=None, timestamp=None):
     reason.title = title
     reason.save()
-    reason.details.apply_edit(
-        edited_by = self,
-        edited_at = timestamp,
-        text = details
-    )
+    return reason.details.apply_edit(edited_by=self,
+                                     edited_at=timestamp,
+                                     text=details)
 
-def user_post_answer(
-                    self,
-                    question = None,
-                    body_text = None,
-                    follow = False,
-                    wiki = False,
-                    timestamp = None,
-                    by_email = False
-                ):
+@reject_forbidden_phrases
+def user_post_answer(self,
+                     question=None,
+                     body_text=None,
+                     follow=False,
+                     wiki=False,
+                     is_private=False,
+                     timestamp=None,
+                     by_email=False,
+                     ip_addr=None):
 
     #todo: move this to assertion - user_assert_can_post_answer
-    if self == question.author and not self.is_administrator():
+    if self.pk == question.author_id and not self.is_administrator():
 
         # check date and rep required to post answer to own question
 
         delta = datetime.timedelta(askbot_settings.MIN_DAYS_TO_ANSWER_OWN_QUESTION)
 
-        now = datetime.datetime.now()
+        now = timezone.now()
         asked = question.added_at
         #todo: this is an assertion, must be moved out
         if (now - asked  < delta and self.reputation < askbot_settings.MIN_REP_TO_ANSWER_OWN_QUESTION):
@@ -1738,9 +2357,13 @@ def user_post_answer(
                 left = ungettext('in %(min)d min','in %(min)d mins',minutes) % {'min':minutes}
             day = ungettext('%(days)d day','%(days)d days',askbot_settings.MIN_DAYS_TO_ANSWER_OWN_QUESTION) % {'days':askbot_settings.MIN_DAYS_TO_ANSWER_OWN_QUESTION}
             error_message = _(
-                'New users must wait %(days)s before answering their own question. '
+                'New users must wait %(days)s to %(answer_own_questions)s. '
                 ' You can post an answer %(left)s'
-                ) % {'days': day,'left': left}
+                ) % {
+                    'days': day,
+                    'left': left,
+                    'answer_own_questions': askbot_settings.WORDS_ANSWER_OWN_QUESTIONS
+                }
             assert(error_message is not None)
             raise django_exceptions.PermissionDenied(error_message)
 
@@ -1750,31 +2373,28 @@ def user_post_answer(
         raise TypeError('question argument must be provided')
     if body_text is None:
         raise ValueError('Body text is required to post answer')
+
     if timestamp is None:
-        timestamp = datetime.datetime.now()
-#    answer = Answer.objects.create_new(
-#        thread = question.thread,
-#        author = self,
-#        text = body_text,
-#        added_at = timestamp,
-#        email_notify = follow,
-#        wiki = wiki
-#    )
-    answer_post = Post.objects.create_new_answer(
-        thread = question.thread,
-        author = self,
-        text = body_text,
-        added_at = timestamp,
-        email_notify = follow,
-        wiki = wiki,
-        by_email = by_email
-    )
-    answer_post.thread.invalidate_cached_data()
+        timestamp = timezone.now()
+
+    answer_post = Post.objects.create_new_answer(thread=question.thread,
+                                                 author=self,
+                                                 text=body_text,
+                                                 added_at=timestamp,
+                                                 email_notify=follow,
+                                                 wiki=wiki,
+                                                 is_private=is_private,
+                                                 by_email=by_email,
+                                                 ip_addr=ip_addr)
+    #add to the answerer's group
+    answer_post.add_to_groups([self.get_personal_group()])
+
+    answer_post.thread.reset_cached_data()
     award_badges_signal.send(None,
-        event = 'post_answer',
-        actor = self,
-        context_object = answer_post
-    )
+                             event='post_answer',
+                             actor=self,
+                             context_object=answer_post,
+                             timestamp=timestamp)
     return answer_post
 
 def user_visit_question(self, question = None, timestamp = None):
@@ -1786,7 +2406,7 @@ def user_visit_question(self, question = None, timestamp = None):
     the post - question, answer or comments
     """
     if timestamp is None:
-        timestamp = datetime.datetime.now()
+        timestamp = timezone.now()
 
     try:
         QuestionView.objects.filter(
@@ -1831,28 +2451,17 @@ def user_visit_question(self, question = None, timestamp = None):
         )
 
 
-def user_is_username_taken(cls,username):
-    try:
-        cls.objects.get(username=username)
-        return True
-    except cls.MultipleObjectsReturned:
-        return True
-    except cls.DoesNotExist:
-        return False
-
 def user_is_administrator(self):
     """checks whether user in the forum site administrator
     the admin must be both superuser and staff member
     the latter is because staff membership is required
     to access the live settings"""
-    return (self.is_superuser and self.is_staff)
+    return self.is_superuser
 
 def user_remove_admin_status(self):
-    self.is_staff = False
     self.is_superuser = False
 
 def user_set_admin_status(self):
-    self.is_staff = True
     self.is_superuser = True
 
 def user_add_missing_askbot_subscriptions(self):
@@ -1878,6 +2487,16 @@ def user_add_missing_askbot_subscriptions(self):
 def user_is_moderator(self):
     return (self.status == 'm' and self.is_administrator() == False)
 
+def user_is_post_moderator(self, post):
+    """True, if user and post have common groups
+    with moderation privilege"""
+    if askbot_settings.GROUPS_ENABLED:
+        group_ids = self.get_groups().values_list('id', flat=True)
+        post_groups = PostToGroup.objects.filter(post=post, group__id__in=group_ids)
+        return post_groups.filter(group__is_vip=True).count() > 0
+    else:
+        return False
+
 def user_is_administrator_or_moderator(self):
     return (self.is_administrator() or self.is_moderator())
 
@@ -1898,7 +2517,7 @@ def user_is_owner_of(self, obj):
     False otherwise
     """
     if isinstance(obj, Post) and obj.post_type == 'question':
-        return self == obj.author
+        return self.pk == obj.author_id
     else:
         raise NotImplementedError()
 
@@ -1920,6 +2539,25 @@ def user_get_anonymous_name(self):
     macros that accept user as parameter
     """
     return get_name_of_anonymous_user()
+
+def user_assign_role_set(self, status):
+    """Assigns roles specific to user `status`.
+    Currently supported status values are: 'administrator' and 'moderator'.
+    """
+    current_roles = self.get_roles()
+    desired_roles = get_role_set(status)
+    for role in desired_roles - current_roles:
+        try:
+            Role.objects.create(user=self, role=role)
+        except IntegrityError:
+            # have an unlikely accident
+            pass
+
+def user_remove_role_set(self, status):
+    """Symmetric method to `user_assign_role_set`"""
+    role_names = get_role_set(status)
+    roles = Role.objects.filter(user=self, role__in=role_names)
+    roles.delete()
 
 def user_set_status(self, new_status):
     """sets new status to user
@@ -1944,12 +2582,17 @@ def user_set_status(self, new_status):
     if new_status == self.status:
         return
 
+    if self.status == 'm':
+        self.remove_role_set('moderator')
+    elif self.status == 'd':
+        self.remove_role_set('administrator')
+
     #clear admin status if user was an administrator
     #because this function is not dealing with the site admins
-
     if new_status == 'd':
         #create a new admin
         self.set_admin_status()
+        self.assign_role_set('administrator')
     else:
         #This was the old method, kept in the else clause when changing
         #to admin, so if you change the status to another thing that
@@ -1967,6 +2610,8 @@ def user_set_status(self, new_status):
             thread.invalidate_cached_post_data()
 
     self.status = new_status
+    if new_status == 'm':
+        self.assign_role_set('moderator')
     self.save()
 
 @auto_now_timestamp
@@ -1984,12 +2629,7 @@ def user_moderate_user_reputation(
     if comment == None:
         raise ValueError('comment is required to moderate user reputation')
 
-    new_rep = user.reputation + reputation_change
-    if new_rep < 1:
-        new_rep = 1 #todo: magic number
-        reputation_change = 1 - user.reputation
-
-    user.reputation = new_rep
+    user.receive_reputation(reputation_change, get_language())
     user.save()
 
     #any question. This is necessary because reputes are read in the
@@ -2001,36 +2641,34 @@ def user_moderate_user_reputation(
     #question record is fake and is ignored
     #this bug is hidden in call Repute.get_explanation_snippet()
     repute = Repute(
-                        user = user,
-                        comment = comment,
-                        #question = fake_question,
-                        reputed_at = timestamp,
-                        reputation_type = 10, #todo: fix magic number
-                        reputation = user.reputation
-                    )
+                user=user,
+                comment=comment,
+                #question = fake_question,
+                reputed_at=timestamp,
+                reputation_type=10, #todo: fix magic number
+                reputation=user.reputation
+            )
     if reputation_change < 0:
         repute.negative = -1 * reputation_change
     else:
         repute.positive = reputation_change
     repute.save()
 
-def user_get_status_display(self, soft = False):
-    if self.is_administrator():
-        return _('Site Adminstrator')
+def user_get_status_display(self):
+    if self.is_approved():
+        return _('Registered User')
+    elif self.is_administrator():
+        return _('Administrator')
     elif self.is_moderator():
-        return _('Forum Moderator')
+        return _('Moderator')
     elif self.is_suspended():
         return  _('Suspended User')
     elif self.is_blocked():
         return _('Blocked User')
-    elif soft == True:
-        return _('Registered User')
     elif self.is_watched():
-        return _('Watched User')
-    elif self.is_approved():
-        return _('Approved User')
+        return _('New User')
     else:
-        raise ValueError('Unknown user status')
+        raise ValueError('Unknown user status %s' % self.status)
 
 
 def user_can_moderate_user(self, other):
@@ -2077,11 +2715,14 @@ def user_get_tag_filtered_questions(self, questions = None):
     if questions is None:
         questions = Post.objects.get_questions()
 
+    language_code = get_language()
+
     if self.email_tag_filter_strategy == const.EXCLUDE_IGNORED:
 
         ignored_tags = Tag.objects.filter(
                                 user_selections__reason = 'bad',
-                                user_selections__user = self
+                                user_selections__user = self,
+                                language_code=language_code
                             )
 
         wk = self.ignored_tags.strip().split()
@@ -2102,7 +2743,8 @@ def user_get_tag_filtered_questions(self, questions = None):
 
         selected_tags = Tag.objects.filter(
                                 user_selections__reason = reason,
-                                user_selections__user = self
+                                user_selections__user = self,
+                                language_code=language_code
                             )
 
         selected_by_wildcards = Tag.objects.get_by_wildcards(wk)
@@ -2123,33 +2765,199 @@ def get_messages(self):
 def delete_messages(self):
     self.message_set.all().delete()
 
-#todo: find where this is used and replace with get_absolute_url
-def get_profile_url(self):
-    """Returns the URL for this User's profile."""
-    return reverse(
-                'user_profile',
-                kwargs={'id':self.id, 'slug':slugify(self.username)}
-            )
 
-def user_get_absolute_url(self):
-    return self.get_profile_url()
+def user_set_languages(self, langs, primary=None):
+    self.languages = ' '.join(langs)
+    if primary:
+        self.primary_language = primary
 
-def get_profile_link(self):
+    profile_objects = LocalizedUserProfile.objects
+
+    profiles = profile_objects.filter(auth_user=self)
+    profile_langs = profiles.values_list('language_code', flat=True)
+
+    profile_langs_set = set(profile_langs)
+    langs_set = set(langs)
+
+    if len(langs):
+        profiles = profile_objects.filter(
+                                    auth_user=self,
+                                    language_code__in=langs,
+                                )
+        profiles.update(is_claimed=True)
+        langs = set(profiles.values_list('language_code', flat=True))
+        for lang in langs_set - profile_langs_set:
+            profile_objects.create(
+                            auth_user=self,
+                            language_code=lang,
+                            is_claimed=True
+                        )
+
+    #mark removed languages as not claimed
+    removed_langs = profile_langs_set - langs_set
+    if len(removed_langs):
+        profiles = profile_objects.filter(
+                                    auth_user=self,
+                                    language_code__in=removed_langs
+                                )
+        profiles.update(is_claimed=False)
+
+    profiles = profile_objects.filter(auth_user=self)
+    for profile in profiles:
+        profile.update_cache()
+
+
+def user_get_languages(self):
+    return self.languages.split()
+
+
+def get_profile_link(self, text=None):
     profile_link = u'<a href="%s">%s</a>' \
-        % (self.get_profile_url(), escape(self.username))
+        % (self.get_profile_url(), escape(text or self.username))
 
     return mark_safe(profile_link)
 
+def user_get_groups(self, private=False):
+    """returns a query set of groups to which user belongs"""
+    #todo: maybe cache this query
+    return Group.objects.get_for_user(self, private=private)
+
+def user_join_default_groups(self):
+    """adds user to "global" and "personal" groups"""
+    #needs to be run when Askbot is added to pre-existing site
+    #and Askbot groups are not populated
+    #In Askbot user by default must by a member of "global" group
+    #and of "personal" group - which is created for each user individually
+    self.edit_group_membership(
+        group=Group.objects.get_global_group(),
+        user=self,
+        action='add'
+    )
+    group_name = format_personal_group_name(self)
+    group = Group.objects.get_or_create(
+        name=group_name, user=self
+    )
+    self.edit_group_membership(
+        group=group, user=self, action='add'
+    )
+
+
+def user_get_personal_group(self):
+    group_name = format_personal_group_name(self)
+    try:
+        #may be absent if askbot is added to pre-existing site
+        return Group.objects.get(name=group_name)
+    except Group.DoesNotExist:
+        self.join_default_groups()
+        return Group.objects.get(name=group_name)
+        
+
+def user_get_foreign_groups(self):
+    """returns a query set of groups to which user does not belong"""
+    #todo: maybe cache this query
+    user_group_ids = self.get_groups().values_list('id', flat = True)
+    return Group.objects.exclude(id__in = user_group_ids)
+
+def user_get_primary_group(self):
+    """a temporary function - returns ether None or
+    first non-personal non-everyone group
+    works only for one real private group per-person
+    """
+    if askbot_settings.GROUPS_ENABLED:
+        groups = self.get_groups(private=True)
+        for group in groups:
+            if group.is_personal():
+                continue
+            return group
+    return None
+
+def user_can_make_group_private_posts(self):
+    """simplest implementation: user belongs to at least one group"""
+    return (self.get_primary_group() != None)
+
+
+def user_request_account_termination(self):
+    """Notifies admins about user account termination"""
+    msg_template = _('User %(username)s, id=%(id)s, %(email)s '
+                  'asked to terminate the account.')
+    admin_msg = msg_template % {'username': self.username,
+                             'id': self.pk,
+                             'email': self.email}
+    email = AccountManagementRequest({'message': admin_msg,
+                                      'username': self.username})
+    mods = get_users_by_role('terminate_accounts')
+    email.send(mods)
+
+
+def user_get_data_export_dir(self):
+    """Returns directory path where exported data is to be held"""
+    return os.path.join(django_settings.ASKBOT_USER_DATA_EXPORT_DIR, str(self.pk))
+
+
+def user_get_backup_file_names(self):
+    """Returns list of user data backup file names"""
+    backup_dir = self.get_data_export_dir()
+    if os.path.exists(backup_dir):
+        return os.listdir(backup_dir)
+    return []
+
+
+def user_get_todays_backup_file_name(self):
+    """Returns todays backup file name or `None`"""
+    backup_dir = self.get_data_export_dir()
+    if not os.path.exists(backup_dir):
+        return None
+
+    today = datetime.date.today()
+    for name in self.get_backup_file_names():
+        if name.endswith('.zip'):
+            path = os.path.join(backup_dir, name)
+            file_mtime = os.path.getmtime(path)
+            file_date = datetime.date.fromtimestamp(file_mtime)
+            if file_date == today:
+                return name
+    return None
+
+
+def user_delete_exported_data(self):
+    """Deletes .zip files in the data export directory"""
+    data_dir = os.path.join(self.get_data_export_dir())
+    if not os.path.exists(data_dir):
+        return
+
+    for item in self.get_backup_file_names():
+        if item.endswith('.zip'):
+            os.remove(os.path.join(data_dir, item))
+
+
+def user_suggest_backup_file_path(self):
+    """Returns full path to the up-to date data export file"""
+    date_token = datetime.date.today().strftime('%d-%m-%Y')
+    file_slug = ascii_slugify(date_token + '-' + 
+                              self.username + '-' +
+                              askbot_settings.APP_SHORT_NAME)
+    file_name = file_slug + '.zip'
+    return os.path.join(self.get_data_export_dir(), file_name)
+
+
+def user_get_group_membership(self, group):
+    """returns a group membership object or None
+    if it is not there
+    """
+    try:
+        return GroupMembership.objects.get(user=self, group=group)
+    except GroupMembership.DoesNotExist:
+        return None
+
+
 def user_get_groups_membership_info(self, groups):
-    """returts a defaultdict with values that are
+    """returns a defaultdict with values that are
     dictionaries with the following keys and values:
-    * key: can_join, value: True if user can join group
-    * key: is_member, value: True if user is member of group
+    * key: acceptance_level, value: 'closed', 'moderated', 'open'
+    * key: membership_level, value: 'none', 'pending', 'full'
 
     ``groups`` is a group tag query set
     """
-    groups = groups.select_related('group_profile')
-
     group_ids = groups.values_list('id', flat = True)
     memberships = GroupMembership.objects.filter(
                                 user__id = self.id,
@@ -2157,17 +2965,16 @@ def user_get_groups_membership_info(self, groups):
                             )
 
     info = collections.defaultdict(
-        lambda: {'can_join': False, 'is_member': False}
+        lambda: {'acceptance_level': 'closed', 'membership_level': 'none'}
     )
     for membership in memberships:
-        info[membership.group_id]['is_member'] = True
+        membership_level = membership.get_level_display()
+        info[membership.group_id]['membership_level'] = membership_level
 
     for group in groups:
-        info[group.id]['can_join'] = group.group_profile.can_accept_user(self)
+        info[group.id]['acceptance_level'] = group.get_openness_level_for_user(self)
 
     return info
-        
-
 
 def user_get_karma_summary(self):
     """returns human readable sentence about
@@ -2179,6 +2986,9 @@ def user_get_badge_summary(self):
     """returns human readable sentence about
     number of badges of different levels earned
     by the user. It is assumed that user has some badges"""
+    if self.gold + self.silver + self.bronze == 0:
+        return ''
+
     badge_bits = list()
     if self.gold:
         bit = ungettext(
@@ -2209,8 +3019,6 @@ def user_get_badge_summary(self):
         badge_str = ', '.join(badge_bits)
         badge_str = _('%(item1)s and %(item2)s') % \
                     {'item1': badge_str, 'item2': last_bit}
-    else:
-        raise ValueError('user must have badges to call this function')
     return _("%(user)s has %(badges)s") % {'user': self.username, 'badges':badge_str}
 
 #series of methods for user vote-type commands
@@ -2221,7 +3029,7 @@ def user_get_badge_summary(self):
 #may be different
 #maybe if we do use business rule checks here - we should add
 #some flag allowing to bypass them for things like the data importers
-def toggle_favorite_question(
+def user_toggle_favorite_question(
                         self, question,
                         timestamp = None,
                         cancel = False,
@@ -2233,29 +3041,44 @@ def toggle_favorite_question(
     about processing the "cancel" option
     another strange thing is that this function unlike others below
     returns a value
+
+    todo: the on-screen follow and email subscription is not
+    fully merged yet - see use of FavoriteQuestion and follow/unfollow question
+    btw, names of the objects/methods is quite misleading ATM
     """
+    self.assert_can_follow_question(question)
+
     try:
+        #this attempts to remove the on-screen follow
         fave = FavoriteQuestion.objects.get(thread=question.thread, user=self)
         fave.delete()
         result = False
         question.thread.update_favorite_count()
+        #this removes email subscription
+        if question.thread.is_followed_by(self):
+            self.unfollow_question(question)
+
     except FavoriteQuestion.DoesNotExist:
         if timestamp is None:
-            timestamp = datetime.datetime.now()
+            timestamp = timezone.now()
         fave = FavoriteQuestion(
             thread = question.thread,
             user = self,
             added_at = timestamp,
         )
         fave.save()
+
+        #this removes email subscription
+        if question.thread.is_followed_by(self) is False:
+            self.follow_question(question)
+
         result = True
         question.thread.update_favorite_count()
         award_badges_signal.send(None,
-            event = 'select_favorite_question',
-            actor = self,
-            context_object = question,
-            timestamp = timestamp
-        )
+                                 event='select_favorite_question',
+                                 actor=self,
+                                 context_object=question,
+                                 timestamp=timestamp)
     return result
 
 VOTES_TO_EVENTS = {
@@ -2311,14 +3134,13 @@ def _process_vote(user, post, timestamp=None, cancel=False, vote_type=None):
             auth.onDownVotedCanceled(vote, post, user, timestamp)
         else:
             auth.onDownVoted(vote, post, user, timestamp)
-            
-    post.thread.invalidate_cached_data()
+
+    post.thread.reset_cached_data()
 
     if post.post_type == 'question':
         #denormalize the question post score on the thread
-        post.thread.score = post.score
+        post.thread.points = post.points
         post.thread.save()
-        post.thread.update_summary_html()
 
     if cancel:
         return None
@@ -2326,12 +3148,30 @@ def _process_vote(user, post, timestamp=None, cancel=False, vote_type=None):
     event = VOTES_TO_EVENTS.get((vote_type, post.post_type), None)
     if event:
         award_badges_signal.send(None,
-                    event = event,
-                    actor = user,
-                    context_object = post,
-                    timestamp = timestamp
-                )
+                                 event=event,
+                                 actor=user,
+                                 context_object=post,
+                                 timestamp=timestamp)
     return vote
+
+def user_fix_html_links(self, text):
+    """depending on the user's privilege, allow links
+    and hotlinked images or replace them with plain text
+    url
+    """
+    is_simple_user = not self.is_administrator_or_moderator()
+    has_low_rep = self.reputation < askbot_settings.MIN_REP_TO_INSERT_LINK
+    if is_simple_user and has_low_rep:
+        result = replace_links_with_text(text)
+        if result != text:
+            message = ungettext(
+                'At least %d karma point is required to post links',
+                'At least %d karma points is required to post links',
+                askbot_settings.MIN_REP_TO_INSERT_LINK
+            ) % askbot_settings.MIN_REP_TO_INSERT_LINK
+            self.message_set.create(message=message)
+            return result
+    return text
 
 def user_unfollow_question(self, question = None):
     self.followed_threads.remove(question.thread)
@@ -2344,7 +3184,7 @@ def user_is_following_question(user, question):
     return question.thread.followed_by.filter(id=user.id).exists()
 
 
-def upvote(self, post, timestamp=None, cancel=False, force = False):
+def upvote(self, post, timestamp=None, cancel=False, force=False):
     #force parameter not used yet
     return _process_vote(
         self,
@@ -2354,7 +3194,7 @@ def upvote(self, post, timestamp=None, cancel=False, force = False):
         vote_type=Vote.VOTE_UP
     )
 
-def downvote(self, post, timestamp=None, cancel=False, force = False):
+def downvote(self, post, timestamp=None, cancel=False, force=False):
     #force not used yet
     return _process_vote(
         self,
@@ -2374,59 +3214,97 @@ def user_approve_post_revision(user, post_revision, timestamp = None):
     post_revision.approved_by = user
     post_revision.approved_at = timestamp
 
-    post_revision.save()
-
     post = post_revision.post
-    post.approved = True
-    post.save()
 
-    if post_revision.post.post_type == 'question':
-        thread = post.thread
-        thread.approved = True
-        thread.save()
-    post.thread.invalidate_cached_data()
+    #approval of unpublished revision
+    if post_revision.revision > 0:
+        post.parse_and_save(author=post_revision.author)
+        post.thread.reset_cached_data()
+        #todo: maybe add a notification here
+    else:
+        post_revision.revision = post.get_latest_revision_number() + 1
 
-    #send the signal of published revision
-    signals.post_revision_published.send(
-        None, revision = post_revision, was_approved = True
-    )
+        post_revision.save()
+
+        if post.approved == False:
+            if post.is_comment():
+                post.parent.comment_count += 1
+                post.parent.save()
+            elif post.is_answer():
+                post.thread.answer_count += 1
+                post.thread.save()
+
+        post.approved = True
+        post.text = post_revision.text
+
+        post_is_new = (post.revisions.count() == 1)
+        parse_results = post.parse_and_save(
+                            author=post_revision.author
+                        )
+
+        signals.post_updated.send(
+            post=post,
+            updated_by=post_revision.author,
+            newly_mentioned_users=parse_results['newly_mentioned_users'],
+            #suppress_email=suppress_email,
+            timestamp=timestamp,
+            created=post_is_new,
+            diff=parse_results['diff'],
+            sender=post.__class__
+        )
+
+        if post_revision.post.post_type == 'question':
+            thread = post.thread
+            thread.approved = True
+            thread.save()
+
+        post.thread.reset_cached_data()
+
+        #send the signal of published revision
+        signals.post_revision_published.send(
+                                        None,
+                                        revision=post_revision,
+                                        was_approved=True
+                                    )
 
 @auto_now_timestamp
-def flag_post(user, post, timestamp=None, cancel=False, cancel_all = False, force = False):
+def flag_post(
+    user, post, timestamp=None, cancel=False, cancel_all=False, force=False
+):
     if cancel_all:
         # remove all flags
         if force == False:
-            user.assert_can_remove_all_flags_offensive(post = post)
+            user.assert_can_remove_all_flags_offensive(post=post)
         post_content_type = ContentType.objects.get_for_model(post)
         all_flags = Activity.objects.filter(
-                        activity_type = const.TYPE_ACTIVITY_MARK_OFFENSIVE,
-                        content_type = post_content_type, object_id=post.id
+                        activity_type=const.TYPE_ACTIVITY_MARK_OFFENSIVE,
+                        content_type=post_content_type,
+                        object_id=post.id
                     )
         for flag in all_flags:
-            auth.onUnFlaggedItem(post, flag.user, timestamp=timestamp)            
+            auth.onUnFlaggedItem(post, flag.user, timestamp=timestamp)
 
     elif cancel:#todo: can't unflag?
         if force == False:
             user.assert_can_remove_flag_offensive(post = post)
-        auth.onUnFlaggedItem(post, user, timestamp=timestamp)        
+        auth.onUnFlaggedItem(post, user, timestamp=timestamp)
 
     else:
         if force == False:
-            user.assert_can_flag_offensive(post = post)
+            user.assert_can_flag_offensive(post=post)
         auth.onFlaggedItem(post, user, timestamp=timestamp)
         award_badges_signal.send(None,
-            event = 'flag_post',
-            actor = user,
-            context_object = post,
-            timestamp = timestamp
-        )
+                                 event='flag_post',
+                                 actor=user,
+                                 context_object=post,
+                                 timestamp=timestamp)
 
 def user_get_flags(self):
     """return flag Activity query set
     for all flags set by te user"""
     return Activity.objects.filter(
-                        user = self,
-                        activity_type = const.TYPE_ACTIVITY_MARK_OFFENSIVE
+                        user=self,
+                        activity_type=const.TYPE_ACTIVITY_MARK_OFFENSIVE
                     )
 
 def user_get_flag_count_posted_today(self):
@@ -2445,6 +3323,16 @@ def user_get_flags_for_post(self, post):
     flags = self.get_flags()
     return flags.filter(content_type = post_content_type, object_id=post.id)
 
+def user_create_email_key(self):
+    email_key = generate_random_key()
+    UserProfile.objects.filter(auth_user_ptr=self).update(email_key=email_key)
+    return email_key
+
+def user_get_or_create_email_key(self):
+    if self.email_key:
+        return self.email_key
+    return self.create_email_key()
+
 def user_update_response_counts(user):
     """Recount number of responses to the user.
     """
@@ -2452,24 +3340,39 @@ def user_update_response_counts(user):
     ACTIVITY_TYPES += (const.TYPE_ACTIVITY_MENTION,)
 
     user.new_response_count = ActivityAuditStatus.objects.filter(
-                                    user = user,
-                                    status = ActivityAuditStatus.STATUS_NEW,
-                                    activity__activity_type__in = ACTIVITY_TYPES
+                                    user=user,
+                                    status=ActivityAuditStatus.STATUS_NEW,
+                                    activity__activity_type__in=ACTIVITY_TYPES
                                 ).count()
     user.seen_response_count = ActivityAuditStatus.objects.filter(
-                                    user = user,
-                                    status = ActivityAuditStatus.STATUS_SEEN,
-                                    activity__activity_type__in = ACTIVITY_TYPES
+                                    user=user,
+                                    status=ActivityAuditStatus.STATUS_SEEN,
+                                    activity__activity_type__in=ACTIVITY_TYPES
                                 ).count()
     user.save()
 
 
-def user_receive_reputation(self, num_points):
-    new_points = self.reputation + num_points
-    if new_points > 0:
-        self.reputation = new_points
-    else:
-        self.reputation = const.MIN_REPUTATION
+def user_receive_reputation(self, num_points, language_code=None):
+    language_code = language_code or get_language()
+    old_points = self.reputation
+    new_points = old_points + num_points
+    self.reputation = max(const.MIN_REPUTATION, new_points)
+
+    #record localized user reputation - this starts with 0
+    try:
+        profile = LocalizedUserProfile.objects.get(
+                                            auth_user=self,
+                                            language_code=language_code
+                                        )
+    except LocalizedUserProfile.DoesNotExist:
+        profile = LocalizedUserProfile(
+                                    auth_user=self,
+                                    language_code=language_code
+                                )
+    profile.reputation = max(0, profile.reputation + num_points)
+    profile.save()
+
+    signals.reputation_received.send(None, user=self, reputation_before=old_points)
 
 def user_update_wildcard_tag_selections(
                                     self,
@@ -2518,54 +3421,121 @@ def user_update_wildcard_tag_selections(
     return new_tags
 
 
-def user_edit_group_membership(self, user = None, group = None, action = None):
+def user_edit_group_membership(self, user=None, group=None,
+                               action=None, force=False,
+                               level=None
+                            ):
     """allows one user to add another to a group
     or remove user from group.
 
     If when adding, the group does not exist, it will be created
     the delete function is not symmetric, the group will remain
     even if it becomes empty
+
+    returns instance of GroupMembership (if action is "add") or None
     """
+    self.assert_can_join_or_leave_group()
     if action == 'add':
-        GroupMembership.objects.get_or_create(user = user, group = group)
+        #calculate new level
+        openness = group.get_openness_level_for_user(user)
+
+        #let people join these special groups, but not leave
+        if not force:
+            if group.name == askbot_settings.GLOBAL_GROUP_NAME:
+                openness = 'open'
+            elif group.name == format_personal_group_name(user):
+                openness = 'open'
+
+            if openness == 'open':
+                level = level or GroupMembership.FULL
+            elif openness == 'moderated':
+                level = level or GroupMembership.PENDING
+            elif openness == 'closed':
+                raise django_exceptions.PermissionDenied()
+        else:
+            level = level or GroupMembership.FULL
+
+        membership, created = GroupMembership.objects.get_or_create(
+                        user=user, group=group, level=level
+                    )
+        return membership
+
     elif action == 'remove':
-        GroupMembership.objects.get(user = user, group = group).delete()
+        GroupMembership.objects.get(user=user, group=group).delete()
+        return None
     else:
         raise ValueError('invalid action')
 
-def user_is_group_member(self, group = None):
-    return self.group_memberships.filter(group = group).count() == 1
+def user_join_group(self, group, force=False, level=None):
+    return self.edit_group_membership(group=group, user=self,
+                                      action='add', force=force,
+                                      level=level)
+
+def user_leave_group(self, group):
+    self.edit_group_membership(group=group, user=self, action='remove')
+
+def user_is_group_member(self, group=None):
+    """True if user is member of group,
+    where group can be instance of Group
+    or name of group as string
+    """
+    if isinstance(group, str):
+        return GroupMembership.objects.filter(
+                user=self, group__name=group
+            ).count() == 1
+    else:
+        return GroupMembership.objects.filter(
+                                user=self, group=group
+                            ).count() == 1
 
 User.add_to_class(
     'add_missing_askbot_subscriptions',
     user_add_missing_askbot_subscriptions
 )
 User.add_to_class(
-    'is_username_taken',
-    classmethod(user_is_username_taken)
-)
-User.add_to_class(
     'get_followed_question_alert_frequency',
     user_get_followed_question_alert_frequency
+)
+User.add_to_class(
+    'get_top_answers_paginator',
+    user_get_top_answers_paginator
 )
 User.add_to_class(
     'subscribe_for_followed_question_alerts',
     user_subscribe_for_followed_question_alerts
 )
 User.add_to_class('get_absolute_url', user_get_absolute_url)
+User.add_to_class('get_avatar_type', user_get_avatar_type)
 User.add_to_class('get_avatar_url', user_get_avatar_url)
+User.add_to_class('can_terminate_account', user_can_terminate_account)
+User.add_to_class('can_manage_account', user_can_manage_account)
+User.add_to_class('calculate_avatar_url', user_calculate_avatar_url)
+User.add_to_class('clear_avatar_urls', user_clear_avatar_urls)
+User.add_to_class('init_avatar_urls', user_init_avatar_urls)
 User.add_to_class('get_default_avatar_url', user_get_default_avatar_url)
 User.add_to_class('get_gravatar_url', user_get_gravatar_url)
 User.add_to_class('get_or_create_fake_user', user_get_or_create_fake_user)
 User.add_to_class('get_marked_tags', user_get_marked_tags)
 User.add_to_class('get_marked_tag_names', user_get_marked_tag_names)
+User.add_to_class('get_groups', user_get_groups)
+User.add_to_class('get_foreign_groups', user_get_foreign_groups)
+User.add_to_class('get_group_membership', user_get_group_membership)
+User.add_to_class('get_personal_group', user_get_personal_group)
+User.add_to_class('get_primary_group', user_get_primary_group)
+User.add_to_class('get_notifications', user_get_notifications)
 User.add_to_class('strip_email_signature', user_strip_email_signature)
 User.add_to_class('get_groups_membership_info', user_get_groups_membership_info)
 User.add_to_class('get_anonymous_name', user_get_anonymous_name)
+User.add_to_class('get_social_sharing_mode', user_get_social_sharing_mode)
+User.add_to_class('get_social_sharing_status', user_get_social_sharing_status)
+User.add_to_class('get_localized_profile', user_get_localized_profile)
 User.add_to_class('update_avatar_type', user_update_avatar_type)
+User.add_to_class('update_localized_profile', user_update_localized_profile)
 User.add_to_class('post_question', user_post_question)
 User.add_to_class('edit_question', user_edit_question)
+User.add_to_class('recount_badges', user_recount_badges)
 User.add_to_class('retag_question', user_retag_question)
+User.add_to_class('repost_comment_as_answer', user_repost_comment_as_answer)
 User.add_to_class('post_answer', user_post_answer)
 User.add_to_class('edit_answer', user_edit_answer)
 User.add_to_class('edit_post', user_edit_post)
@@ -2578,7 +3548,7 @@ User.add_to_class('edit_comment', user_edit_comment)
 User.add_to_class('create_post_reject_reason', user_create_post_reject_reason)
 User.add_to_class('edit_post_reject_reason', user_edit_post_reject_reason)
 User.add_to_class('delete_post', user_delete_post)
-User.add_to_class('post_tag_wiki', user_post_tag_wiki)
+User.add_to_class('post_object_description', user_post_object_description)
 User.add_to_class('visit_question', user_visit_question)
 User.add_to_class('upvote', upvote)
 User.add_to_class('downvote', downvote)
@@ -2590,27 +3560,40 @@ User.add_to_class(
     user_get_flag_count_posted_today
 )
 User.add_to_class('get_flags_for_post', user_get_flags_for_post)
-User.add_to_class('get_profile_url', get_profile_url)
+User.add_to_class('get_profile_url', user_get_profile_url)
+User.add_to_class('get_unsubscribe_url', user_get_unsubscribe_url)
+User.add_to_class('get_subscriptions_url', user_get_subscriptions_url)
+User.add_to_class('get_or_create_email_key', user_get_or_create_email_key)
+User.add_to_class('create_email_key', user_create_email_key)
 User.add_to_class('get_profile_link', get_profile_link)
 User.add_to_class('get_tag_filtered_questions', user_get_tag_filtered_questions)
 User.add_to_class('get_messages', get_messages)
 User.add_to_class('delete_messages', delete_messages)
-User.add_to_class('toggle_favorite_question', toggle_favorite_question)
+User.add_to_class('toggle_favorite_question', user_toggle_favorite_question)
+User.add_to_class('fix_html_links', user_fix_html_links)
 User.add_to_class('follow_question', user_follow_question)
 User.add_to_class('unfollow_question', user_unfollow_question)
 User.add_to_class('is_following_question', user_is_following_question)
 User.add_to_class('mark_tags', user_mark_tags)
+User.add_to_class('merge_duplicate_questions', user_merge_duplicate_questions)
 User.add_to_class('update_response_counts', user_update_response_counts)
+User.add_to_class('can_create_tags', user_can_create_tags)
 User.add_to_class('can_have_strong_url', user_can_have_strong_url)
 User.add_to_class('can_post_by_email', user_can_post_by_email)
 User.add_to_class('can_post_comment', user_can_post_comment)
+User.add_to_class('can_make_group_private_posts', user_can_make_group_private_posts)
 User.add_to_class('is_administrator', user_is_administrator)
 User.add_to_class('is_administrator_or_moderator', user_is_administrator_or_moderator)
+User.add_to_class('is_admin_or_mod', user_is_administrator_or_moderator) #shorter version
 User.add_to_class('set_admin_status', user_set_admin_status)
 User.add_to_class('edit_group_membership', user_edit_group_membership)
+User.add_to_class('join_group', user_join_group)
+User.add_to_class('join_default_groups', user_join_default_groups)
+User.add_to_class('leave_group', user_leave_group)
 User.add_to_class('is_group_member', user_is_group_member)
 User.add_to_class('remove_admin_status', user_remove_admin_status)
 User.add_to_class('is_moderator', user_is_moderator)
+User.add_to_class('is_post_moderator', user_is_post_moderator)
 User.add_to_class('is_approved', user_is_approved)
 User.add_to_class('is_watched', user_is_watched)
 User.add_to_class('is_suspended', user_is_suspended)
@@ -2618,16 +3601,29 @@ User.add_to_class('is_blocked', user_is_blocked)
 User.add_to_class('is_owner_of', user_is_owner_of)
 User.add_to_class('has_interesting_wildcard_tags', user_has_interesting_wildcard_tags)
 User.add_to_class('has_ignored_wildcard_tags', user_has_ignored_wildcard_tags)
+User.add_to_class('assign_role_set', user_assign_role_set)
+User.add_to_class('remove_role_set', user_remove_role_set)
+User.add_to_class('has_role', user_has_role)
+User.add_to_class('get_roles', user_get_roles)
 User.add_to_class('can_moderate_user', user_can_moderate_user)
+User.add_to_class('can_see_karma', user_can_see_karma)
 User.add_to_class('has_affinity_to_question', user_has_affinity_to_question)
+User.add_to_class('has_badge', user_has_badge)
 User.add_to_class('moderate_user_reputation', user_moderate_user_reputation)
 User.add_to_class('set_status', user_set_status)
+User.add_to_class('get_badge_summary', user_get_badge_summary)
+User.add_to_class('get_languages', user_get_languages)
+User.add_to_class('set_languages', user_set_languages)
 User.add_to_class('get_status_display', user_get_status_display)
 User.add_to_class('get_old_vote_for_post', user_get_old_vote_for_post)
 User.add_to_class('get_unused_votes_today', user_get_unused_votes_today)
 User.add_to_class('delete_comment', user_delete_comment)
 User.add_to_class('delete_question', user_delete_question)
 User.add_to_class('delete_answer', user_delete_answer)
+User.add_to_class(
+    'delete_all_content_authored_by_user',
+    user_delete_all_content_authored_by_user
+)
 User.add_to_class('restore_post', user_restore_post)
 User.add_to_class('close_question', user_close_question)
 User.add_to_class('reopen_question', user_reopen_question)
@@ -2638,14 +3634,26 @@ User.add_to_class(
     user_update_wildcard_tag_selections
 )
 User.add_to_class('approve_post_revision', user_approve_post_revision)
+User.add_to_class('needs_moderation', user_needs_moderation)
+User.add_to_class('notify_users', user_notify_users)
+User.add_to_class('is_read_only', user_is_read_only)
+User.add_to_class('get_data_export_dir', user_get_data_export_dir)
+User.add_to_class('delete_exported_data', user_delete_exported_data)
+User.add_to_class('suggest_backup_file_path', user_suggest_backup_file_path)
+User.add_to_class('get_backup_file_names', user_get_backup_file_names)
+User.add_to_class('get_todays_backup_file_name', user_get_todays_backup_file_name)
+User.add_to_class('request_account_termination', user_request_account_termination)
 
 #assertions
 User.add_to_class('assert_can_vote_for_post', user_assert_can_vote_for_post)
 User.add_to_class('assert_can_revoke_old_vote', user_assert_can_revoke_old_vote)
 User.add_to_class('assert_can_upload_file', user_assert_can_upload_file)
+User.add_to_class('assert_can_mark_tags', user_assert_can_mark_tags)
+User.add_to_class('assert_can_merge_questions', user_assert_can_merge_questions)
 User.add_to_class('assert_can_post_question', user_assert_can_post_question)
 User.add_to_class('assert_can_post_answer', user_assert_can_post_answer)
 User.add_to_class('assert_can_post_comment', user_assert_can_post_comment)
+User.add_to_class('assert_can_post_text', user_assert_can_post_text)
 User.add_to_class('assert_can_edit_post', user_assert_can_edit_post)
 User.add_to_class('assert_can_edit_deleted_post', user_assert_can_edit_deleted_post)
 User.add_to_class('assert_can_see_deleted_post', user_assert_can_see_deleted_post)
@@ -2654,6 +3662,7 @@ User.add_to_class('assert_can_edit_answer', user_assert_can_edit_answer)
 User.add_to_class('assert_can_close_question', user_assert_can_close_question)
 User.add_to_class('assert_can_reopen_question', user_assert_can_reopen_question)
 User.add_to_class('assert_can_flag_offensive', user_assert_can_flag_offensive)
+User.add_to_class('assert_can_follow_question', user_assert_can_follow_question)
 User.add_to_class('assert_can_remove_flag_offensive', user_assert_can_remove_flag_offensive)
 User.add_to_class('assert_can_remove_all_flags_offensive', user_assert_can_remove_all_flags_offensive)
 User.add_to_class('assert_can_retag_question', user_assert_can_retag_question)
@@ -2662,6 +3671,8 @@ User.add_to_class('assert_can_delete_post', user_assert_can_delete_post)
 User.add_to_class('assert_can_restore_post', user_assert_can_restore_post)
 User.add_to_class('assert_can_delete_comment', user_assert_can_delete_comment)
 User.add_to_class('assert_can_edit_comment', user_assert_can_edit_comment)
+User.add_to_class('assert_can_convert_post', user_assert_can_convert_post)
+
 User.add_to_class('assert_can_delete_answer', user_assert_can_delete_answer)
 User.add_to_class('assert_can_delete_question', user_assert_can_delete_question)
 User.add_to_class('assert_can_accept_best_answer', user_assert_can_accept_best_answer)
@@ -2674,141 +3685,10 @@ User.add_to_class(
     user_assert_can_approve_post_revision
 )
 
-#todo: move this to askbot/mail ?
-def format_instant_notification_email(
-                                        to_user = None,
-                                        from_user = None,
-                                        post = None,
-                                        reply_address = None,
-                                        alt_reply_address = None,
-                                        update_type = None,
-                                        template = None,
-                                    ):
-    """
-    returns text of the instant notification body
-    and subject line
 
-    that is built when post is updated
-    only update_types in const.RESPONSE_ACTIVITY_TYPE_MAP_FOR_TEMPLATES
-    are supported
-    """
+def reset_cached_post_data(sender, instance, **kwargs):
+    instance.reset_cached_data()
 
-    site_url = askbot_settings.APP_URL
-    origin_post = post.get_origin_post()
-    #todo: create a better method to access "sub-urls" in user views
-    user_subscriptions_url = site_url + \
-                                reverse(
-                                    'user_subscriptions',
-                                    kwargs = {
-                                        'id': to_user.id,
-                                        'slug': slugify(to_user.username)
-                                    }
-                                )
-
-    if update_type == 'question_comment':
-        assert(isinstance(post, Post) and post.is_comment())
-        assert(post.parent and post.parent.is_question())
-    elif update_type == 'answer_comment':
-        assert(isinstance(post, Post) and post.is_comment())
-        assert(post.parent and post.parent.is_answer())
-    elif update_type == 'answer_update':
-        assert(isinstance(post, Post) and post.is_answer())
-    elif update_type == 'new_answer':
-        assert(isinstance(post, Post) and post.is_answer())
-    elif update_type == 'question_update':
-        assert(isinstance(post, Post) and post.is_question())
-    elif update_type == 'new_question':
-        assert(isinstance(post, Post) and post.is_question())
-    else:
-        raise ValueError('unexpected update_type %s' % update_type)
-
-    if update_type.endswith('update'):
-        assert('comment' not in update_type)
-        revisions = post.revisions.all()[:2]
-        assert(len(revisions) == 2)
-        content_preview = htmldiff(
-                sanitize_html(revisions[1].html),
-                sanitize_html(revisions[0].html),
-                ins_start = '<b><u style="background-color:#cfc">',
-                ins_end = '</u></b>',
-                del_start = '<del style="color:#600;background-color:#fcc">',
-                del_end = '</del>'
-            )
-        #todo: remove hardcoded style
-    else:
-        content_preview = post.format_for_email(is_leaf_post = True)
-
-    #add indented summaries for the parent posts
-    content_preview += post.format_for_email_as_parent_thread_summary()
-
-    content_preview += '<p>======= Full thread summary =======</p>'
-
-    content_preview += post.thread.format_for_email()
-
-    if post.is_comment():
-        if update_type.endswith('update'):
-            user_action = _('%(user)s edited a %(post_link)s.')
-        else:
-            user_action = _('%(user)s posted a %(post_link)s') 
-    elif post.is_answer():
-        if update_type.endswith('update'):
-            user_action = _('%(user)s edited an %(post_link)s.')
-        else:
-            user_action = _('%(user)s posted an %(post_link)s.') 
-    elif post.is_question():
-        if update_type.endswith('update'):
-            user_action = _('%(user)s edited a %(post_link)s.')
-        else:
-            user_action = _('%(user)s posted a %(post_link)s.') 
-    else:
-        raise ValueError('unrecognized post type')
-
-    post_url = strip_path(site_url) + post.get_absolute_url()
-    user_url = strip_path(site_url) + from_user.get_absolute_url()
-    user_action = user_action % {
-        'user': '<a href="%s">%s</a>' % (user_url, from_user.username),
-        'post_link': '<a href="%s">%s</a>' % (post_url, _(post.post_type))
-    }
-
-    can_reply = to_user.can_post_by_email()
-
-    if can_reply:
-        reply_separator = const.SIMPLE_REPLY_SEPARATOR_TEMPLATE % \
-                    _('To reply, PLEASE WRITE ABOVE THIS LINE.')
-        if post.post_type == 'question' and alt_reply_address:
-            data = {
-                'addr': alt_reply_address,
-                'subject': urllib.quote(
-                        ('Re: ' + post.thread.title).encode('utf-8')
-                    )
-            }
-            reply_separator += '<p>' + \
-                const.REPLY_WITH_COMMENT_TEMPLATE % data
-            reply_separator += '</p>'
-    else:
-        reply_separator = user_action
-                    
-    update_data = {
-        'update_author_name': from_user.username,
-        'receiving_user_name': to_user.username,
-        'receiving_user_karma': to_user.reputation,
-        'reply_by_email_karma_threshold': askbot_settings.MIN_REP_TO_POST_BY_EMAIL,
-        'can_reply': can_reply,
-        'content_preview': content_preview,#post.get_snippet()
-        'update_type': update_type,
-        'post_url': post_url,
-        'origin_post_title': origin_post.thread.title,
-        'user_subscriptions_url': user_subscriptions_url,
-        'reply_separator': reply_separator
-    }
-    subject_line = _('"%(title)s"') % {'title': origin_post.thread.title}
-
-    content = template.render(Context(update_data))
-    if can_reply:
-        content += '<p style="font-size:8px;color:#aaa">' + \
-                    reply_address + '</p>'
-
-    return subject_line, content
 
 def get_reply_to_addresses(user, post):
     """Returns one or two email addresses that can be
@@ -2816,7 +3696,7 @@ def get_reply_to_addresses(user, post):
     the first address - always a real email address,
     the second address is not ``None`` only for "question" posts.
 
-    When the user is notified of a new question - 
+    When the user is notified of a new question -
     i.e. `post` is a "quesiton", he/she
     will need to choose - whether to give a question or a comment,
     thus we return the second address - for the comment reply.
@@ -2853,94 +3733,38 @@ def get_reply_to_addresses(user, post):
                                                 ).as_email_address()
     return primary_addr, secondary_addr
 
-#todo: action
-def send_instant_notifications_about_activity_in_post(
-                                                update_activity = None,
-                                                post = None,
-                                                recipients = None,
-                                            ):
-    """
-    function called when posts are updated
-    newly mentioned users are carried through to reduce
-    database hits
-    """
-    if post.is_approved() is False:
-        return
 
-    if recipients is None:
-        return
-
-    acceptable_types = const.RESPONSE_ACTIVITY_TYPES_FOR_INSTANT_NOTIFICATIONS
-
-    if update_activity.activity_type not in acceptable_types:
-        return
-
-    #calculate some variables used in the loop below
-    from askbot.skins.loaders import get_template
-    update_type_map = const.RESPONSE_ACTIVITY_TYPE_MAP_FOR_TEMPLATES
-    update_type = update_type_map[update_activity.activity_type]
-    origin_post = post.get_origin_post()
-    headers = mail.thread_headers(
-                            post,
-                            origin_post,
-                            update_activity.activity_type
-                        )
-    #send email for all recipients
-    for user in recipients:
-
-        if user.is_blocked():
-            continue
-
-        reply_address, alt_reply_address = get_reply_to_addresses(user, post)
-
-        subject_line, body_text = format_instant_notification_email(
-                            to_user = user,
-                            from_user = update_activity.user,
-                            post = post,
-                            reply_address = reply_address,
-                            alt_reply_address = alt_reply_address,
-                            update_type = update_type,
-                            template = get_template('instant_notification.html')
-                        )
-      
-        headers['Reply-To'] = reply_address
-        mail.send_mail(
-            subject_line = subject_line,
-            body_text = body_text,
-            recipient_list = [user.email],
-            related_object = origin_post,
-            activity_type = const.TYPE_ACTIVITY_EMAIL_UPDATE_SENT,
-            headers = headers
-        )
-
-def notify_author_of_published_revision(
-    revision = None, was_approved = None, **kwargs
-):
+def notify_author_of_published_revision(revision=None, was_approved=False, **kwargs):
     """notifies author about approved post revision,
     assumes that we have the very first revision
     """
     #only email about first revision
     if revision.should_notify_author_about_publishing(was_approved):
         from askbot.tasks import notify_author_of_published_revision_celery_task
-        notify_author_of_published_revision_celery_task.delay(revision)
-    
+        defer_celery_task(
+            notify_author_of_published_revision_celery_task,
+            args=(revision.pk,)
+        )
+
 
 #todo: move to utils
 def calculate_gravatar_hash(instance, **kwargs):
     """Calculates a User's gravatar hash from their email address."""
+    user = instance
     if kwargs.get('raw', False):
         return
-    clean_email = instance.email.strip().lower()
-    instance.gravatar = hashlib.md5(clean_email).hexdigest()
+    clean_email = user.email.strip().lower()
+    user.gravatar = hashlib.md5(clean_email).hexdigest()
 
 
 def record_post_update_activity(
         post,
-        newly_mentioned_users = None,
-        updated_by = None,
-        timestamp = None,
-        created = False,
-        diff = None,
+        newly_mentioned_users=None,
+        updated_by=None,
+        suppress_email=False,
+        timestamp=None,
+        created=False,
+        diff=None,
         **kwargs
     ):
     """called upon signal askbot.models.signals.post_updated
@@ -2948,12 +3772,6 @@ def record_post_update_activity(
 
     this handler will set notifications about the post
     """
-    if post.needs_moderation():
-        #do not give notifications yet
-        #todo: it is possible here to trigger
-        #moderation email alerts
-        return
-
     assert(timestamp != None)
     assert(updated_by != None)
     if newly_mentioned_users is None:
@@ -2961,14 +3779,19 @@ def record_post_update_activity(
 
     from askbot import tasks
 
-    tasks.record_post_update_celery_task.delay(
-        post_id = post.id,
-        post_content_type_id = ContentType.objects.get_for_model(post).id,
-        newly_mentioned_user_id_list = [u.id for u in newly_mentioned_users],
-        updated_by_id = updated_by.id,
-        timestamp = timestamp,
-        created = created,
-        diff = diff,
+    mentioned_ids = [u.id for u in newly_mentioned_users]
+
+    defer_celery_task(
+        tasks.record_post_update_celery_task,
+        kwargs = {
+            'post_id': post.id,
+            'newly_mentioned_user_id_list': mentioned_ids,
+            'updated_by_id': updated_by.id,
+            'suppress_email': suppress_email,
+            'timestamp': timestamp,
+            'created': created,
+            'diff': diff,
+        }
     )
 
 
@@ -3011,16 +3834,17 @@ def notify_award_message(instance, created, **kwargs):
     if created:
         user = instance.user
 
-        badge = get_badge(instance.badge.slug)
+        with override(user.primary_language):
+            badge = get_badge(instance.badge.slug)
 
-        msg = _(u"Congratulations, you have received a badge '%(badge_name)s'. "
-                u"Check out <a href=\"%(user_profile)s\">your profile</a>.") \
-                % {
-                    'badge_name':badge.name,
-                    'user_profile':user.get_profile_url()
-                }
+            msg = _(u"Congratulations, you have received a badge '%(badge_name)s'. "
+                    u"Check out <a href=\"%(user_profile)s\">your profile</a>.") \
+                    % {
+                        'badge_name':badge.name,
+                        'user_profile':user.get_profile_url()
+                    }
 
-        user.message_set.create(message=msg)
+            user.message_set.create(message=msg)
 
 def record_answer_accepted(instance, created, **kwargs):
     """
@@ -3032,10 +3856,12 @@ def record_answer_accepted(instance, created, **kwargs):
 
     question = instance.thread._question_post()
 
-    if not created and instance.accepted():
+    if not created and instance.endorsed:
         activity = Activity(
+                        #pretty bad: user must be actor
                         user=question.author,
-                        active_at=datetime.datetime.now(),
+                        active_at=timezone.now(),
+                        #content object must be answer!
                         content_object=question,
                         activity_type=const.TYPE_ACTIVITY_MARK_ANSWER,
                         question=question
@@ -3051,19 +3877,61 @@ def record_user_visit(user, timestamp, **kwargs):
     when user visits any pages, we update the last_seen and
     consecutive_days_visit_count
     """
-    prev_last_seen = user.last_seen or datetime.datetime.now()
+    prev_last_seen = user.last_seen or timezone.now()
     user.last_seen = timestamp
-    if (user.last_seen - prev_last_seen).days == 1:
+    consecutive_days = user.consecutive_days_visit_count
+    if (user.last_seen.date() - prev_last_seen.date()).days == 1:
         user.consecutive_days_visit_count += 1
+        consecutive_days = user.consecutive_days_visit_count
         award_badges_signal.send(None,
-            event = 'site_visit',
-            actor = user,
-            context_object = user,
-            timestamp = timestamp
-        )
+                                 event='site_visit',
+                                 actor=user,
+                                 context_object=user,
+                                 timestamp=timestamp)
     #somehow it saves on the query as compared to user.save()
-    User.objects.filter(id = user.id).update(last_seen = timestamp)
+    update_data = {
+        'last_seen': timestamp,
+        'consecutive_days_visit_count': consecutive_days
+    }
+    UserProfile.objects.filter(pk=user.pk).update(**update_data)
+    profile = UserProfile.objects.get(pk=user.pk)
+    profile.update_cache()
 
+
+def record_question_visit(request, question, **kwargs):
+    if functions.not_a_robot_request(request):
+        #todo: split this out into a subroutine
+        #todo: merge view counts per user and per session
+        #1) view count per session
+        if 'question_view_times' not in request.session:
+            request.session['question_view_times'] = {}
+
+        last_seen = request.session['question_view_times'].get(question.id, None)
+
+        if last_seen and timezone.is_naive(last_seen) \
+            and getattr(django_settings, 'USE_TZ', False):
+            last_seen = timezone.make_aware(last_seen, timezone.utc)
+
+        update_view_count = False
+        if question.thread.last_activity_by_id != request.user.id:
+            if last_seen:
+                if last_seen < question.thread.last_activity_at:
+                    update_view_count = True
+            else:
+                update_view_count = True
+
+        request.session['question_view_times'][question.id] = timezone.now()
+        #2) run the slower jobs in a celery task
+        from askbot import tasks
+        defer_celery_task(
+            tasks.record_question_visit,
+            kwargs={
+                'question_post_id': question.id,
+                'user_id': request.user.id,
+                'update_view_count': update_view_count,
+                'language_code': get_language()
+            }
+        )
 
 def record_vote(instance, created, **kwargs):
     """
@@ -3091,7 +3959,7 @@ def record_cancel_vote(instance, **kwargs):
     """
     activity = Activity(
                     user=instance.user,
-                    active_at=datetime.datetime.now(),
+                    active_at=timezone.now(),
                     content_object=instance,
                     activity_type=const.TYPE_ACTIVITY_CANCEL_VOTE
                 )
@@ -3099,9 +3967,19 @@ def record_cancel_vote(instance, **kwargs):
     activity.save()
 
 
+def delete_post_activities(instance, **kwargs):
+    """Deletes items connected to instance via generic relations
+    upon removal of objects from the database"""
+    from askbot import tasks
+    ctype = ContentType.objects.get_for_model(instance)
+    aa = Activity.objects.filter(object_id=instance.pk, content_type=ctype)
+    aa.delete()
+    instance.delete_update_notifications(False) #don't keep activities
+
+
 #todo: weird that there is no record delete answer or comment
 #is this even necessary to keep track of?
-def record_delete_question(instance, delete_by, **kwargs):
+def record_delete_post(instance, deleted_by, **kwargs):
     """
     when user deleted the question
     """
@@ -3113,19 +3991,22 @@ def record_delete_question(instance, delete_by, **kwargs):
         return
 
     activity = Activity(
-                    user=delete_by,
-                    active_at=datetime.datetime.now(),
+                    user=deleted_by,
+                    active_at=timezone.now(),
                     content_object=instance,
                     activity_type=activity_type,
                     question = instance.get_origin_post()
                 )
-    #no need to set receiving user here
     activity.save()
 
+    #keep activity records, but delete notifications
+    instance.delete_update_notifications(True)
+
 def record_flag_offensive(instance, mark_by, **kwargs):
+    """places flagged post on the moderation queue"""
     activity = Activity(
                     user=mark_by,
-                    active_at=datetime.datetime.now(),
+                    active_at=timezone.now(),
                     content_object=instance,
                     activity_type=const.TYPE_ACTIVITY_MARK_OFFENSIVE,
                     question=instance.get_origin_post()
@@ -3135,7 +4016,7 @@ def record_flag_offensive(instance, mark_by, **kwargs):
 #    recipients = instance.get_author_list(
 #                                        exclude_list = [mark_by]
 #                                    )
-    activity.add_recipients(get_admins_and_moderators())
+    activity.add_recipients(instance.get_moderators())
 
 def remove_flag_offensive(instance, mark_by, **kwargs):
     "Remove flagging activity"
@@ -3158,17 +4039,16 @@ def record_update_tags(thread, tags, user, timestamp, **kwargs):
     """
     for tag in tags:
         award_badges_signal.send(None,
-            event = 'update_tag',
-            actor = user,
-            context_object = tag,
-            timestamp = timestamp
-        )
+                                 event='update_tag',
+                                 actor=user,
+                                 context_object=tag,
+                                 timestamp=timestamp)
 
     question = thread._question_post()
 
     activity = Activity(
                     user=user,
-                    active_at=datetime.datetime.now(),
+                    active_at=timezone.now(),
                     content_object=question,
                     activity_type=const.TYPE_ACTIVITY_UPDATE_TAGS,
                     question = question
@@ -3182,7 +4062,7 @@ def record_favorite_question(instance, created, **kwargs):
     if created:
         activity = Activity(
                         user=instance.user,
-                        active_at=datetime.datetime.now(),
+                        active_at=timezone.now(),
                         content_object=instance,
                         activity_type=const.TYPE_ACTIVITY_FAVORITE,
                         question=instance.thread._question_post()
@@ -3196,43 +4076,19 @@ def record_favorite_question(instance, created, **kwargs):
 def record_user_full_updated(instance, **kwargs):
     activity = Activity(
                     user=instance,
-                    active_at=datetime.datetime.now(),
+                    active_at=timezone.now(),
                     content_object=instance,
                     activity_type=const.TYPE_ACTIVITY_USER_FULL_UPDATED
                 )
     activity.save()
 
-def send_respondable_email_validation_message(
-    user = None, subject_line = None, data = None, template_name = None
-):
-    """sends email validation message to the user
 
-    We validate email by getting user's reply
-    to the validation message by email, which also gives
-    an opportunity to extract user's email signature.
+def add_user_to_default_groups(sender, instance, created, **kwargs):
+    """auto-joins user to his/her personal group
+    ``instance`` is an instance of ``User`` class
     """
-    reply_address = ReplyAddress.objects.create_new(
-                                    user = user,
-                                    reply_action = 'validate_email'
-                                )
-    data['email_code'] = reply_address.address
-
-    from askbot.skins.loaders import get_template
-    template = get_template(template_name)
-    body_text = template.render(Context(data))
-
-    reply_to_address = 'welcome-%s@%s' % (
-                            reply_address.address,
-                            askbot_settings.REPLY_BY_EMAIL_HOSTNAME
-                        )
-
-    mail.send_mail(
-        subject_line = subject_line,
-        body_text = body_text,
-        recipient_list = [user.email, ],
-        activity_type = const.TYPE_ACTIVITY_VALIDATION_EMAIL_SENT,
-        headers = {'Reply-To': reply_to_address}
-    )
+    if created:
+        instance.join_default_groups()
 
 
 def greet_new_user(user, **kwargs):
@@ -3241,23 +4097,28 @@ def greet_new_user(user, **kwargs):
     todo: second branch should send email with a simple
     clickable link.
     """
-    if askbot_settings.NEW_USER_GREETING:
-        user.message_set.create(message = askbot_settings.NEW_USER_GREETING)
+    if askbot_settings.NEW_USER_GREETING.strip():
+        user.message_set.create(message=askbot_settings.NEW_USER_GREETING)
+
+    import sys
+    if 'test' in sys.argv:
+        return
 
     if askbot_settings.REPLY_BY_EMAIL:#with this on we also collect signature
-        template_name = 'email/welcome_lamson_on.html'
+        reply_address = ReplyAddress.objects.create_new(
+                                        user=user,
+                                        reply_action='validate_email'
+                                    )
+        email = WelcomeEmailRespondable({
+            'recipient_user': user,
+            'email_code': reply_address.address,
+            'reply_to_address': reply_address.as_email_address(prefix='welcome-')
+        })
     else:
-        template_name = 'email/welcome_lamson_off.html'
+        email = WelcomeEmail({'user': user})
 
-    data = {
-        'site_name': askbot_settings.APP_SHORT_NAME
-    }
-    send_respondable_email_validation_message(
-        user = user,
-        subject_line = _('Welcome to %(site_name)s') % data,
-        data = data,
-        template_name = template_name
-    )
+    email.send([user.email,])
+
 
 
 def complete_pending_tag_subscriptions(sender, request, *args, **kwargs):
@@ -3278,12 +4139,55 @@ def complete_pending_tag_subscriptions(sender, request, *args, **kwargs):
             message = _('Your tag subscription was saved, thanks!')
         )
 
+def set_administrator_flag(sender, instance, *args, **kwargs):
+    user = instance
+    if user.is_superuser:
+        if instance.status != 'd':
+            instance.status = 'd'
+    elif instance.status == 'd':
+        instance.status = 'a'
+
+
+def init_avatar_type(sender, instance, *args, **kwargs):
+    user = instance
+    #if user is new, set avatar type
+    if not user.pk:
+        user.avatar_type = askbot_settings.AVATAR_TYPE_FOR_NEW_USERS
+
+
+def init_avatar_urls(sender, instance, *args, **kwargs):
+    instance.init_avatar_urls()
+
 def add_missing_subscriptions(sender, instance, created, **kwargs):
     """``sender`` is instance of ``User``. When the ``User``
     is created, any required email subscription settings will be
     added by this handler"""
     if created:
         instance.add_missing_askbot_subscriptions()
+
+def add_missing_tag_subscriptions(sender, instance, created, **kwargs):
+    '''``sender` is instance of `User``. When the user is created
+    it add the tag subscriptions to the user via BulkTagSubscription
+    and MarkedTags.
+    '''
+    if created:
+        if askbot_settings.SUBSCRIBED_TAG_SELECTOR_ENABLED and \
+                askbot_settings.GROUPS_ENABLED:
+            user_groups = instance.get_groups()
+            for subscription in BulkTagSubscription.objects.filter(groups__in=user_groups):
+                tag_list = subscription.tag_list()
+                instance.mark_tags(tagnames = tag_list,
+                                reason='subscribed', action='add')
+
+def notify_punished_users(user, **kwargs):
+    try:
+        _assert_user_can(
+                    user=user,
+                    blocked_user_cannot=True,
+                    suspended_user_cannot=True
+                )
+    except django_exceptions.PermissionDenied as e:
+        user.message_set.create(message = unicode(e))
 
 def post_anonymous_askbot_content(
                                 sender,
@@ -3296,90 +4200,362 @@ def post_anonymous_askbot_content(
     """signal handler, unfortunately extra parameters
     are necessary for the signal machinery, even though
     they are not used in this function"""
-    user.post_anonymous_askbot_content(session_key)
+    if user.is_blocked() or user.is_suspended():
+        pass
+    else:
+        user.post_anonymous_askbot_content(session_key)
 
-def set_user_avatar_type_flag(instance, created, **kwargs):
-    instance.user.update_avatar_type()
-
-def update_user_avatar_type_flag(instance, **kwargs):
-    instance.user.update_avatar_type()
-
-def make_admin_if_first_user(instance, **kwargs):
+def make_admin_if_first_user(user, **kwargs):
     """first user automatically becomes an administrator
     the function is run only once in the interpreter session
-    """    
-    import sys
-    #have to check sys.argv to satisfy the test runner
-    #which fails with the cache-based skipping
-    #for real the setUp() code in the base test case must
-    #clear the cache!!!
-    if 'test' not in sys.argv and cache.cache.get('admin-created'):
-        #no need to hit the database every time!
-        return
+
+    function is run when user registers
+    """
     user_count = User.objects.all().count()
-    if user_count == 0:
-        instance.set_admin_status()
-    cache.cache.set('admin-created', True)
+    if user_count == 1:
+        user.set_status('d')
 
 
-#signal for User model save changes
-django_signals.pre_save.connect(make_admin_if_first_user, sender=User)
-django_signals.pre_save.connect(calculate_gravatar_hash, sender=User)
-django_signals.post_save.connect(add_missing_subscriptions, sender=User)
-django_signals.post_save.connect(record_award_event, sender=Award)
-django_signals.post_save.connect(notify_award_message, sender=Award)
-django_signals.post_save.connect(record_answer_accepted, sender=Post)
-django_signals.post_save.connect(record_vote, sender=Vote)
-django_signals.post_save.connect(record_favorite_question, sender=FavoriteQuestion)
+def init_language_settings(user, **kwargs):
+    lang = get_language()
+    user.set_languages([lang,], primary=lang)
+    user.askbot_profile.save()
 
-if 'avatar' in django_settings.INSTALLED_APPS:
-    from avatar.models import Avatar
-    django_signals.post_save.connect(set_user_avatar_type_flag,sender=Avatar)
-    django_signals.post_delete.connect(update_user_avatar_type_flag, sender=Avatar)
 
-django_signals.post_delete.connect(record_cancel_vote, sender=Vote)
+def make_invited_moderator(user, **kwargs):
+    """If user's email matches one of the values in "INVITED_MODERATORS"
+    setting, change status of this user to "moderator"
+    """
+    from askbot.models.user import (get_invited_moderators,
+                                    remove_email_from_invited_moderators)
+
+    mods = get_invited_moderators(include_registered=True)
+    invited_emails = [m.email for m in mods]
+    if user.email in invited_emails:
+        remove_email_from_invited_moderators(user.email)
+        user.set_status('m')
+
+
+def moderate_group_joining(sender, instance=None, created=False, **kwargs):
+    if created and instance.level == GroupMembership.PENDING:
+        user = instance.user
+        group = instance.group
+        user.notify_users(
+                notification_type=const.TYPE_ACTIVITY_ASK_TO_JOIN_GROUP,
+                recipients = group.get_moderators(),
+                content_object = group
+            )
+
+#this variable and the signal handler below is
+#needed to work around the issue in the django admin
+#where auth_user table editing affects group memberships
+GROUP_MEMBERSHIP_LEVELS = dict()
+def group_membership_changed(**kwargs):
+    sender = kwargs['sender']
+    user = kwargs['instance']
+    action = kwargs['action']
+    reverse = kwargs['reverse']
+    model = kwargs['model']
+    pk_set = kwargs['pk_set']
+
+    if reverse:
+        raise NotImplementedError()
+
+    #store group memberships info
+    #and then delete group memberships
+    if action == 'pre_clear':
+        #get membership info, if exists, save
+        memberships = GroupMembership.objects.filter(user=user)
+        for gm in memberships:
+            GROUP_MEMBERSHIP_LEVELS[(user.id, gm.group.id)] = gm.level
+        memberships.delete()
+    elif action == 'post_add':
+        group_ids = pk_set
+        for group_id in group_ids:
+            gm_key = (user.id, group_id)
+            #mend group membership if it does not exist
+            if not GroupMembership.objects.filter(user=user, group__id=group_id).exists():
+                try:
+                    group = Group.objects.get(id=group_id)
+                except Group.DoesNotExist:
+                    #this is not an Askbot group, no group profile
+                    #so we don't add anything here
+                    pass
+                else:
+                    # Restore group membership.
+                    # Default level is FULL - to handle the case
+                    # when group is added via admin interface.
+                    level = GROUP_MEMBERSHIP_LEVELS.get(gm_key,
+                                                        GroupMembership.FULL)
+                    GroupMembership.objects.create(user=user,
+                                                   group=group,
+                                                   level=level)
+
+            GROUP_MEMBERSHIP_LEVELS.pop(gm_key, None)
+
+
+def tweet_new_post(sender, user=None, question=None, answer=None, form_data=None, **kwargs):
+    """seends out tweets about the new post"""
+    from askbot.tasks import tweet_new_post_task
+    post = question or answer
+    defer_celery_task(tweet_new_post_task, args=(post.id,))
+
+def autoapprove_reputable_user(user=None, reputation_before=None, *args, **kwargs):
+    """if user is 'watched' we change status to 'approved'
+    if user's rep crossed the auto-approval margin"""
+    margin = askbot_settings.MIN_REP_TO_AUTOAPPROVE_USER
+    if user.is_watched() and reputation_before < margin and user.reputation >= margin:
+        user.set_status('a')
+
+def record_spam_rejection(
+    sender, spam=None, text=None, user=None, ip_addr='unknown', **kwargs
+):
+    """Record spam autorejection activity
+    Only one record per user kept
+
+    todo: this might be factored out into the moderation app
+    and data might be tracked in some other record
+    """
+    now = timezone.now()
+    summary = 'Found spam text: %s, posted from ip=%s in\n%s' % \
+                        (spam, ip_addr, text)
+
+    spam_type = const.TYPE_ACTIVITY_FORBIDDEN_PHRASE_FOUND
+    act_list = Activity.objects.filter(user=user, activity_type=spam_type)
+    if len(act_list) == 0:
+        activity = Activity(
+                        activity_type=spam_type,
+                        user=user,
+                        active_at=now,
+                        content_object=user,
+                        summary=summary
+                    )
+        activity.save()
+    else:
+        activity = act_list[0]
+        activity.active_at = now
+        activity.summary = summary
+        activity.save()
+
+
+# signals for User model save changes
+user_signals = [
+    signals.GenericSignal(
+        django_signals.post_save,
+        callback=calculate_gravatar_hash,
+        dispatch_uid='calculate_gravatar_hash_on_user_save',
+    ),
+    signals.GenericSignal(
+        django_signals.post_save,
+        callback=set_administrator_flag,
+        dispatch_uid='set_administrator_flag_on_user_save',
+    ),
+    signals.GenericSignal(
+        django_signals.post_save,
+        callback=init_avatar_type,
+        dispatch_uid='init_avatar_type_on_user_create'
+    ),
+    signals.GenericSignal(
+        django_signals.post_save,
+        callback=init_avatar_urls,
+        dispatch_uid='init_avatar_urls_on_user_save',
+    ),
+    signals.GenericSignal(
+        django_signals.post_save,
+        callback=add_missing_subscriptions,
+        dispatch_uid='add_missing_subscriptions_on_user_save',
+    ),
+    signals.GenericSignal(
+        django_signals.post_save,
+        callback=add_user_to_default_groups,
+        dispatch_uid='add_user_to_default_groups_on_user_save',
+    ),
+    signals.GenericSignal(
+        django_signals.post_save,
+        callback=add_missing_tag_subscriptions,
+        dispatch_uid='add_missing_tag_subscriptions_on_user_save',
+    ),
+    signals.GenericSignal(
+        signals.user_updated,
+        callback=record_user_full_updated,
+        dispatch_uid='record_full_profile_upon_user_update',
+    ),
+]
+
+
+for signal in user_signals:
+    register_user_signal(signal)
+
+
+django_signals.post_save.connect(
+    record_award_event,
+    sender=Award,
+    dispatch_uid='record_award_event_on_user_save'
+)
+django_signals.post_save.connect(
+    notify_award_message,
+    sender=Award,
+    dispatch_uid='notify_user_on_award_save'
+)
+django_signals.post_save.connect(
+    record_answer_accepted,
+    sender=Post,
+    dispatch_uid='record_answer_accepted_on_answer_save'
+)
+django_signals.post_save.connect(
+    record_vote,
+    sender=Vote,
+    dispatch_uid='record_vote_activity_on_vote_save'
+)
+django_signals.post_save.connect(
+    record_favorite_question,
+    sender=FavoriteQuestion,
+    dispatch_uid='record_favorite_question_on_fave_save'
+)
+django_signals.post_save.connect(
+    moderate_group_joining,
+    sender=GroupMembership,
+    dispatch_uid='moderate_group_joining_on_gm_save'
+)
+django_signals.m2m_changed.connect(
+    group_membership_changed,
+    sender=User.groups.through,
+    dispatch_uid='record_group_membership_change_on_group_change'
+)
+
+django_signals.post_delete.connect(
+    record_cancel_vote,
+    sender=Vote,
+    dispatch_uid='record_cancel_vote_on_vote_delete'
+)
+
+django_signals.pre_delete.connect(
+    delete_post_activities,
+    sender=Post,
+    dispatch_uid='delete_post_activities_on_post_pre_delete'
+)
 
 #change this to real m2m_changed with Django1.2
-signals.delete_question_or_answer.connect(record_delete_question, sender=Post)
-signals.flag_offensive.connect(record_flag_offensive, sender=Post)
-signals.remove_flag_offensive.connect(remove_flag_offensive, sender=Post)
-signals.tags_updated.connect(record_update_tags)
-signals.user_registered.connect(greet_new_user)
-signals.user_updated.connect(record_user_full_updated, sender=User)
-signals.user_logged_in.connect(complete_pending_tag_subscriptions)#todo: add this to fake onlogin middleware
-signals.user_logged_in.connect(post_anonymous_askbot_content)
-signals.post_updated.connect(record_post_update_activity)
+signals.after_post_removed.connect(
+    record_delete_post,
+    sender=Post,
+    dispatch_uid='record_delete_question_on_delete_post'
+)
+signals.flag_offensive.connect(
+    record_flag_offensive,
+    sender=Post,
+    dispatch_uid='record_flag_offensive_on_post_flag'
+)
+signals.remove_flag_offensive.connect(
+    remove_flag_offensive,
+    sender=Post,
+    dispatch_uid='remove_flag_offensive_on_post_unflag'
+)
+signals.tags_updated.connect(
+    record_update_tags,
+    dispatch_uid='record_tag_update'
+)
+signals.user_registered.connect(
+    greet_new_user,
+    dispatch_uid='greet_user_upon_registration'
+)
+signals.user_registered.connect(
+    make_admin_if_first_user,
+    dispatch_uid='make_amin_first_registrant'
+)
+signals.user_registered.connect(
+    init_language_settings,
+    dispatch_uid='update_language_settings_upon_registration'
+)
+signals.user_registered.connect(
+        make_invited_moderator,
+        dispatch_uid='make_invited_moderator'
+        )
+
+signals.user_logged_in.connect(
+    complete_pending_tag_subscriptions,
+    dispatch_uid='complete_pending_tag_subs_on_user_login'
+)#todo: add this to fake onlogin middleware
+signals.user_logged_in.connect(
+    notify_punished_users,
+    dispatch_uid='notify_punished_users_on_login'
+)
+signals.user_logged_in.connect(
+    post_anonymous_askbot_content,
+    dispatch_uid='post_anon_content_on_login'
+)
+"""
+signals.post_save.connect(
+    reset_cached_post_data,
+    sender=Thread,
+    dispatch_uid='reset_cached_post_data',
+)
+"""
+signals.post_updated.connect(
+    record_post_update_activity,
+    dispatch_uid='record_post_update_activity'
+)
+signals.new_answer_posted.connect(
+    tweet_new_post,
+    dispatch_uid='tweet_on_new_answer'
+)
+signals.new_question_posted.connect(
+    tweet_new_post,
+    dispatch_uid='tweet_on_new_question'
+)
+signals.reputation_received.connect(
+    autoapprove_reputable_user,
+    dispatch_uid='autoapprove_reputable_user'
+)
+signals.spam_rejected.connect(
+    record_spam_rejection,
+    dispatch_uid='record_spam_rejection'
+)
 
 #probably we cannot use post-save here the point of this is
 #to tell when the revision becomes publicly visible, not when it is saved
-signals.post_revision_published.connect(notify_author_of_published_revision)
-signals.site_visited.connect(record_user_visit)
+signals.post_revision_published.connect(
+    notify_author_of_published_revision,
+    dispatch_uid='notify_authon_of_published_revision'
+)
+signals.site_visited.connect(
+    record_user_visit,
+    dispatch_uid='record_user_visit'
+)
+signals.question_visited.connect(
+    record_question_visit,
+    dispatch_uid='record_question_visit'
+)
 
 #set up a possibility for the users to follow others
-try:
-    import followit
-    followit.register(User)
-except ImportError:
-    pass
+#try:
+#    import followit
+#    followit.register(User)
+#except ImportError:
+#    pass
+
 
 __all__ = [
         'signals',
-
         'Thread',
 
         'QuestionView',
         'FavoriteQuestion',
         'AnonymousQuestion',
+        'DraftQuestion',
 
         'AnonymousAnswer',
+        'DraftAnswer',
 
         'Post',
         'PostRevision',
+        'PostToGroup',
 
         'Tag',
         'Vote',
         'PostFlagReason',
         'MarkedTag',
+        'TagSynonym',
 
         'BadgeData',
         'Award',
@@ -3389,12 +4565,15 @@ __all__ = [
         'ActivityAuditStatus',
         'EmailFeedSetting',
         'GroupMembership',
-        'GroupProfile',
+        'Group',
 
         'User',
+        'UserProfile',
 
         'ReplyAddress',
 
+        'ImportRun',
+        'ImportedObjectInfo',
+
         'get_model',
-        'get_admins_and_moderators'
 ]

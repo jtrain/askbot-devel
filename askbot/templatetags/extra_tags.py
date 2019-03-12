@@ -1,11 +1,12 @@
 import math
 from django import template
+from django.template import RequestContext
+from django.template.loader import get_template
 from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext as _
 from django.core.urlresolvers import reverse
 from askbot.utils import functions
 from askbot.utils.slug import slugify
-from askbot.skins.loaders import get_template
 from askbot.conf import settings as askbot_settings
 
 register = template.Library()
@@ -14,7 +15,7 @@ GRAVATAR_TEMPLATE = (
                      '<a style="text-decoration:none" '
                      'href="%(user_profile_url)s"><img class="gravatar" '
                      'width="%(size)s" height="%(size)s" '
-                     'src="http://www.gravatar.com/avatar/%(gravatar_hash)s'
+                     'src="%(gravatar_url)s/%(gravatar_hash)s'
                      '?s=%(size)s&amp;d=%(gravatar_type)s&amp;r=PG" '
                      'title="%(username)s" '
                      'alt="%(alt_text)s" /></a>')
@@ -36,6 +37,7 @@ def gravatar(user, size):
                     )
     #safe_username = template.defaultfilters.urlencode(username)
     return mark_safe(GRAVATAR_TEMPLATE % {
+        'gravatar_url': askbot_settings.GRAVATAR_BASE_URL,
         'user_profile_url': user_profile_url,
         'size': size,
         'gravatar_hash': functions.get_from_dict_or_object(user, 'gravatar'),
@@ -43,7 +45,7 @@ def gravatar(user, size):
         'alt_text': _('%(username)s gravatar image') % {'username': user.username},
         'username': functions.get_from_dict_or_object(user, 'username'),
     })
-    
+
 @register.simple_tag
 def get_tag_font_size(tags):
     max_tag = 0
@@ -59,7 +61,7 @@ def get_tag_font_size(tags):
     font_size = {}
     for tag in tags:
         font_size[tag.name] = tag_font_size(max_tag,min_tag,tag.used_count)
-    
+
     return font_size
 
 @register.simple_tag
@@ -74,12 +76,12 @@ def tag_font_size(max_size, min_size, current_size):
 
     #avoid invalid calculation
     if current_size == 0:
-        current_size = 1    
+        current_size = 1
     try:
         weight = (math.log10(current_size) - math.log10(min_size)) / (math.log10(max_size) - math.log10(min_size))
     except Exception:
         weight = 0
-        
+
     return int(MIN_FONTSIZE + round((MAX_FONTSIZE - MIN_FONTSIZE) * weight))
 
 
@@ -90,8 +92,8 @@ class IncludeJinja(template.Node):
         self.request_var = template.Variable(request_var)
     def render(self, context):
         request = self.request_var.resolve(context)
-        jinja_template = get_template(self.filename, request)
-        return jinja_template.render(context)
+        jinja_template = get_template(self.filename)
+        return jinja_template.render(RequestContext(request, context))
 
 @register.tag
 def include_jinja(parser, token):
@@ -112,4 +114,3 @@ def include_jinja(parser, token):
         raise template.TemplateSyntaxError('file name must be quoted')
 
     return IncludeJinja(filename, request_var)
-

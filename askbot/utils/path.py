@@ -1,21 +1,22 @@
+from __future__ import print_function
 import os
 import errno
 
 def mkdir_p(path):
     """same as action of the unix command
-    mkdir -p 
+    mkdir -p
     """
     try:
         os.makedirs(path)
-    except OSError, e:
+    except OSError as e:
         if e.errno == errno.EEXIST:
             pass
-        else: 
+        else:
             raise e
 
 def extend_file_name(file_path, extension):
-    """append file extension to a string that 
-    represents file name, if the string does not 
+    """append file extension to a string that
+    represents file name, if the string does not
     already have that same extension"""
     if not file_path.endswith(extension):
         file_path += extension
@@ -28,5 +29,5 @@ def create_file_if_does_not_exist(file_path, print_warning = True):
         return open(file_path, 'w+')
     else:
         if print_warning:
-            print "File %s exists" % file_path
+            print("File %s exists" % file_path)
         return None

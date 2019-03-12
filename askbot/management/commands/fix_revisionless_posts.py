@@ -2,6 +2,7 @@
 that do not have revisions by creating a fake initial revision
 based on the content stored in the post itself
 """
+from __future__ import print_function
 from django.core.management.base import NoArgsCommand
 from django.db.models import signals, Count
 from askbot import models
@@ -11,20 +12,21 @@ def fix_revisionless_posts(post_class):
         posts = post_class.objects.annotate(
                                         rev_count = Count('revisions')
                                     ).filter(rev_count = 0)
-        print 'have %d corrupted posts' % len(posts)
+        print('have %d corrupted posts' % len(posts))
         for post in posts:
-            post.add_revision(
-                        author = post.author,
-                        text = post.text,
-                        comment = const.POST_STATUS['default_version'],
-                        revised_at = post.added_at
+            rev = post.add_revision(
+                        author=post.author,
+                        text=post.text,
+                        comment=unicode(const.POST_STATUS['default_version']),
+                        revised_at=post.added_at
                     )
             post.last_edited_at = None
             post.last_edited_by = None
+            post.current_revision = rev
             post.save()
 
 class Command(NoArgsCommand):
-    """Command class for "fix_answer_counts" 
+    """Command class for "fix_answer_counts"
     """
 
     def remove_save_signals(self):

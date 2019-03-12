@@ -1,8 +1,198 @@
 Changes in Askbot
 =================
 
-Development version
--------------------
+Develpment version
+------------------
+* Remember scroll position for the browser navigation
+* GDPR compliance (export data, cancel/request to cancel account)
+* Updated Facebook login Api to v2.8
+* Implemented "Invited Moderators" feature available
+  via settings -> moderation -> invited moderators
+
+0.10.2 (Dec 21, 2016)
+---------------------
+* Bug fixes for the previous version
+
+0.10.1 (Nov 16, 2016)
+---------------------
+* Added settings `ASKBOT_ALLOWED_HTML_ELEMENTS` and
+  `ASKBOT_ALLOWED_HTML_ATTRIBUTES`
+* Allow custom markdown parser via `ASKBOT_MARKDOWN_CLASS` setting
+* Applied Akismet check (if enabled) to editing of all content
+* Updated Facebook API to v2.2.
+* Unsubscribe link feature
+* User profile "about" section is per-language (localizable)
+* Tag names with diacritic characters are allowed
+* Inline editing of questions and answer
+* Markdown editor expands automatically
+* Added ASKBOT_LANGUAGE_MODE setting, which can be one of
+  'single-lang', 'url-lang', 'user-lang'. The 'user-lang'
+  option allows users to see posts of several user-selected
+  languages in the single listing of questions. The 'url-lang'
+  option shows questions in one listing per language.
+* Added option to close new account registrations
+* Added support of CAS protocol
+
+0.10.0 (Dec 7, 2015)
+--------------------
+* Supports Django 1.8
+* Added management command `askbot_rebuild_avatars`
+* Added option to choose gravatar or default avatar for new users
+* Message on the feedback page is editable
+* Added support for the NoCaptcha recaptcha
+
+NOTE::
+  Releases 0.10.x support Django 1.8, 0.9.x - Django 1.7,
+  0.7.x support Django 1.5, 0.8.x - 1.6 and to be used
+  only to migrate to the higher versions of the Django framework
+  from 1.5. See https://pypi.python.org/pypi/askbot/ 
+  to download the latest available version.
+
+0.7.53 (Apr 22, 2015)
+---------------------
+* Use prompt placeholders on all registration forms
+* Disable Google login by default because it is now OAuth2
+
+
+0.7.52 (Apr 19, 2015)
+---------------------
+* Added account recovery form to the "complete registration" page
+  to help prevent accidental creation of duplicate accounts
+* Support migration of Google OpenID accounts to G+
+* Added setting to allow comment updates show on the main page
+* Improved support of uploadable avatars
+* Added authentication via MediaWiki
+* Added option to specify `ASKBOT_QUESTION_TITLE_RENDERER` function
+* Added option to specify `ASKBOT_HTML_MODERATOR` function
+* Allowed reordering badges on the badges page via drag and drop
+* Added option to forbid commenting in closed questions
+* Added separate optional time limits to edit questions and answers
+* Added option to disable comments under questions or answers
+* Added management command `askbot_recount_badges`
+* Allowed adding custom badges via `ASKBOT_CUSTOM_BADGES` setting
+* Allowed enabling and disabling individual badges
+* Added "forbidden phrases" for the content moderation
+  Posts containing these will be rejected outright, without placement
+  on the moderation queue.
+* Added minimum reputation to delete own questions with answers
+* Added optional checkbox "accept terms of service"
+  which being enabled, requires users to read and agree
+  with the terms before signing up.
+* Added terms of service page
+* Allowed reverse ordering of comments
+
+0.7.51 (Dec 15, 2014)
+---------------------
+* Bug fixes
+
+0.7.50 (Nov 1, 2014)
+--------------------
+* Added email alert for moderators `askbot_send_moderation_alerts`
+* Implemented Google Plus login
+* Allowed localized site settings
+* Added management command `askbot_clear_moderation_queue`
+* Admins and Moderators can merge questions.
+* Improved moderation modes: flags, audit, premoderation. 
+  Watched user status, IP blocking, mass content removal.
+* Allow bulk deletion of user content simultaneously with blocking
+* Allow custom destination url under the logo
+* Option to allow asking without registration (Egil Moeller)
+* Implemented Mozilla Persona authentication
+* Allowed custom providers of gravatar service (michas2)
+* Allowed configurable custom OpenID login button
+* Allowed custom list of feedback recipients (Keto)
+* Added option to show user's emails to the moderators
+* Added Read-Only mode for the site in the "access control" section.
+* Added `askbot_add_osqa_content` management command.
+* Management command to add data from other Askbot site.
+* Allowed simple overrides of livesettings with `ASKBOT_...` prefixed 
+  variables in the `settings.py` file.
+
+0.7.49 (Sep 19, 2013)
+---------------------
+* Support for Solr search backend (Adolfo)
+* Allowed read-only access user groups (Adolfo)
+* Added simple read-only API (Adolfo)
+* Added "admin email" to livesettings (Evgeny)
+* Improved Zendesk import feature `Kevin Porterfield, Shotgun Software<http://www.shotgunsoftware.com>_`
+* Added backend support for the tag synonyms `pcompassion https://github.com/pcompassion`_
+* Added management command `apply_hinted_tags` to batch-apply tags from a list (Evgeny)
+* Added hovercard on the user's karma display in the header (Evgeny)
+* Added option to hide ad blocks from logged in users (Evgeny)
+* Applied Askbot templates to the settings control panel (Evgeny)
+* Added option to auto-follow questions by the question posters with default "on" (Evgeny)
+* Support for Django 1.5
+* Auto-tweet option for questions and answers
+* Added Chech and Croatian translations
+* Disable/enable best answer feature
+* Allowed post owners repost answers and comments (this used to be mod-only function).
+* Answer editor is "folded" by default. Editor buttons and options show on click.
+* Management command `askbot_import_jive` to import data from Jive forums.
+* Added possibility to choose editor for comments: plain text, or same as
+  editor used for the questions or answers: WMD or TinyMCE.
+* Added ajax search to the tags page
+* Added a placeholder template for the custom javascript on the question page
+* Allowed to disable the big "ask" button.
+* Some support for the media compression (Tyler Mandry)
+* Allowed to enable and disable question scopes on the main page
+* Added full text support for some languages with Postgresql:
+  Danish, Dutch, English, Finnish, French, German, Hungarian,
+  Italian, Japanese (requires package textsearch_ja), Norwegian,
+  Portugese, Romanian, Russian, Spanish, Swedish, Turkish.
+* repost answer as a comment under the previous (older) answer
+* minor edit option for question and answer, to suppress email alerts
+* allowed tags to be created upon marking them as interesting/ignored/subscribed
+
+0.7.48 (Jan 28, 2013)
+---------------------
+* made "how to ask the question" instructions editable
+* added RSS auto-discovery link
+* added support for multilingual site (experimental)
+* tag subscription manager on the tags page (Adolfo)
+
+0.7.47 (Dec 13, 2012)
+---------------------
+* Bugfix release
+
+0.7.46 (Dec 12, 2012)
+---------------------
+* Bugfix release
+
+0.7.45 (Dec 12, 2012)
+---------------------
+* Feedback sender's email is added to the Reply-To header
+  in the feedback form (Evgeny)
+* Reimplemented search as drop-down (Evgeny)
+* Basic design to work on smartphones (Evgeny)
+* Allowed use of alternative form on the user signup page (Evgeny)
+
+0.7.44 (Nov 11, 2012)
+---------------------
+* Support for django 1.4 (Adolfo)
+* Added option to enable/disable rss feeds (Evgeny)
+* Added minimum reputation to insert links and hotlinked images (Evgeny)
+* Added minimum reputation to suggest links as plain text (Evgeny)
+* Added support of Haystack for search (Adolfo)
+* Added minimum reputation setting to accept any answer as correct (Evgeny)
+* Added "VIP" option to groups - if checked, all posts belong to the group and users of that group in the future will be able to moderate those posts. Moderation features for VIP group are in progress (Evgeny)
+* Added setting `NOTIFICATION_DELAY_TIME` to use with enabled celery daemon (Adolfo)
+* Added setting `ASKBOT_INTERNAL_IPS` - to allow anonymous access to 
+  closed sites from dedicated IP addresses (Evgeny)
+* Moved default skin from `askbot/skins/default` to simply `askbot` (Evgeny)
+* Repost comment as answer (Adolfo)
+* Question list widget (Adolfo)
+* Ask a question widget (Adolfo)
+* Embeddable widget generator (Adolfo)
+* Groups are shown in the dropdown menu in the header (Adolfo)
+* Added group moderation requests to the moderators inboxes (Evgeny)
+* Group joining may be open/closed or moderated (Evgeny)
+* Adding "extra options" to the ldap session (Evgeny)
+* Tag moderation (Evgeny)
+* Editable optional three level category selector for the tags (Evgeny)
+* Tag editor adding tags as they are typed (Evgeny)
+* Added optional support for unicode slugs (Evgeny)
+* Allow switching comment with answer and answer with question comment (Adolfo)
+* Allow user names longer than 30 characters (Evgeny)
 * Option to disable feedback form for the anonymos users (Evgeny)
 * Optional restriction to have confirmed email address to join forum (Evgeny)
 * Optional list of allowed email addresses and email domain name for the new users (Evgeny)

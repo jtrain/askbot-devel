@@ -1,36 +1,25 @@
-"""Utilities for the MySQL backend"""
+"""
+This module served as a helper for the South orm
+by mitigating absence of access to the django model api
+
+Moved to askbot/utils/mysql.py in case these methods might be useful
+"""
 from django.db import connection
 
-#in-memory cached variable
-SUPPORTS_FTS = None
-
-def supports_full_text_search():
-    """True if the database engine is MyISAM"""
-    from askbot.models import Post
-    global SUPPORTS_FTS
-    if SUPPORTS_FTS is None:
-        cursor = connection.cursor()
-        table_name = Post._meta.db_table
-        cursor.execute("SHOW CREATE TABLE %s" % table_name)
-        data = cursor.fetchone()
-        if 'ENGINE=MyISAM' in data[1]:
-            SUPPORTS_FTS = True
-        else:
-            SUPPORTS_FTS = False
-    return SUPPORTS_FTS
+def mysql_table_supports_full_text_search(table_name):
+    """true, if engine is MyISAM"""
+    cursor = connection.cursor()
+    cursor.execute("SHOW CREATE TABLE %s" % table_name)
+    data = cursor.fetchone()
+    return 'ENGINE=MyISAM' in data[1]
 
 
-# This is needed to maintain compatibility with the old 0004 migration
-# Usually South migrations should be self-contained and shouldn't depend on anything but themselves,
-# but 0004 is an unfortunate exception
-def supports_full_text_search_migr0004():
-    global SUPPORTS_FTS
-    if SUPPORTS_FTS is None:
-        cursor = connection.cursor()
-        cursor.execute("SHOW CREATE TABLE question") # In migration 0004 model forum.Question used db table `question`
-        data = cursor.fetchone()
-        if 'ENGINE=MyISAM' in data[1]:
-            SUPPORTS_FTS = True
-        else:
-            SUPPORTS_FTS = False
-    return SUPPORTS_FTS
+def get_drop_index_sql(index_name, table_name):
+    """returns sql for dropping index by name on table"""
+    return 'ALTER TABLE %s DROP INDEX %s' % (table_name, index_name)
+
+
+def get_create_full_text_index_sql(index_name, table_name, column_list):
+    column_sql = '(%s)' % ','.join(column_list)
+    query_template = 'CREATE FULLTEXT INDEX %s on %s %s'
+    return query_template % (index_name, table_name, column_sql)

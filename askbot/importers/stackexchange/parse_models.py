@@ -1,3 +1,4 @@
+from __future__ import print_function
 from xml.etree import ElementTree as et
 import sys
 import re
@@ -46,7 +47,7 @@ def get_table_name(name):
     else:
         bits = name.split('2')
         bits = map(singular, bits)
-        out += '2'.join(bits) 
+        out += '2'.join(bits)
     return out
 
 class DjangoModel(object):
@@ -75,7 +76,7 @@ class DjangoField(object):
     def __str__(self):
         out  = '%s = %s(' % (self.name, types[self.type])
         if self.type == 'FK':
-            out += "'%s'" % self.relation  
+            out += "'%s'" % self.relation
             out += ", related_name='%s_by_%s_set'" % (self.table.name, self.name)
             out += ', null=True'#nullable to make life easier
         elif self.type == 'PK':
@@ -108,7 +109,7 @@ class DjangoFK(DjangoField):
         self.set_relation(name)
 
     def set_relation(self, name):
-        """some relations need to be mapped 
+        """some relations need to be mapped
         to actual tables
         """
         self.relation = table_prefix
@@ -132,7 +133,7 @@ def get_col_type(col):
         try:
             restriction = int(type_e.getchildren()[0].get('value'))
         except:
-            restriction = -1 
+            restriction = -1
         if restriction > 400:
             type = 'text'
             restriction = -1
@@ -209,7 +210,7 @@ def parse_value(input, field_object):
         except:
             raise Exception('datetime expected "%s" found' % input)
 
-print 'from django.db import models'
+print('from django.db import models')
 for file in sys.argv:
     if '.xsd' in file:
         tname = os.path.basename(file).replace('.xsd','')
@@ -222,4 +223,4 @@ for file in sys.argv:
             field = make_field_from_xml_tree(col)
             if field:
                 model.add_field(field)
-        print model
+        print(model)

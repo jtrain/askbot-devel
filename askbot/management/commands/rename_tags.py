@@ -2,10 +2,12 @@
 it to another, all corresponding questions are automatically
 retagged
 """
+from __future__ import print_function
 import sys
-from optparse import make_option
+from django.conf import settings as django_settings
 from django.core import management
 from django.core.management.base import BaseCommand, CommandError
+from django.utils import translation
 from askbot import api, models
 from askbot.utils import console
 
@@ -13,8 +15,8 @@ def get_admin(seed_user_id = None):
     """requests admin with an optional seeded user id
     """
     try:
-        admin = api.get_admin(seed_user_id = seed_user_id)
-    except models.User.DoesNotExist, e:
+        admin = api.get_admin(seed_user_id=seed_user_id)
+    except models.User.DoesNotExist as e:
         raise CommandError(e)
 
     if admin.id != seed_user_id:
@@ -28,13 +30,12 @@ would you like to select default moderator %s, id=%d
 to run this operation?""" % (seed_user_id, admin.username, admin.id)
         choice = console.choice_dialog(prompt, choices = ('yes', 'no'))
         if choice == 'no':
-            print 'Canceled'
+            print('Canceled')
             sys.exit()
     return admin
 
 def parse_tag_names(input):
-    decoded_input = input.decode(sys.stdin.encoding)
-    return set(decoded_input.strip().split(' '))
+    return set(console.decode_input(input).split(' '))
 
 def format_tag_ids(tag_list):
     return ' '.join([str(tag.id) for tag in tag_list])
@@ -59,31 +60,36 @@ list of questions that are to be affected before running this operation.
 The tag rename operation cannot be undone, but the command will
 ask you to confirm your action before making changes.
     """
-    option_list = BaseCommand.option_list + (
-        make_option('--from',
-            action = 'store',
-            type = 'str',
-            dest = 'from',
-            default = None,
-            help = 'list of tag names which needs to be replaced'
-        ),
-        make_option('--to',
-            action = 'store',
-            type = 'str',
-            dest = 'to',
-            default = None,
-            help = 'list of tag names that are to be used instead'
-        ),
-        make_option('--user-id',
-            action = 'store',
-            type = 'int',
-            dest = 'user_id',
-            default = None,
-            help = 'id of the user who will be marked as a performer of this operation'
-        ),
-    )
+    def add_arguments(self, parser):
+        parser.add_argument('--from',
+            action='store',
+            type=str,
+            dest='from',
+            default=None,
+            help='list of tag names which needs to be replaced'
+        )
+        parser.add_argument('--to',
+            action='store',
+            type=str,
+            dest='to',
+            default=None,
+            help='list of tag names that are to be used instead'
+        )
+        parser.add_argument('--user-id',
+            action='store',
+            type=int,
+            dest='user_id',
+            default=None,
+            help='id of the user who will be marked as a performer of this operation'
+        )
+        parser.add_argument('--lang',
+            action='store',
+            type=str,
+            dest='lang',
+            default=django_settings.LANGUAGE_CODE,
+            help='language code for the tags to rename e.g. "en"'
+        )
 
-    #@transaction.commit_manually
     def handle(self, *args, **options):
         """command handle function. reads tag names, decodes
         them using the standard input encoding and attempts to find
@@ -94,6 +100,7 @@ ask you to confirm your action before making changes.
 
         The data of tag id's is then delegated to the command "rename_tag_id"
         """
+        translation.activate(django_settings.LANGUAGE_CODE)
         if options['from'] is None:
             raise CommandError('the --from argument is required')
         if options['to'] is None:
@@ -113,7 +120,11 @@ ask you to confirm your action before making changes.
         from_tags = list()
         try:
             for tag_name in from_tag_names:
-                from_tags.append(models.Tag.objects.get(name = tag_name))
+                tag = models.Tag.objects.get(
+                                    name=tag_name,
+                                    language_code=options['lang']
+                                )
+                from_tags.append(tag)
         except models.Tag.DoesNotExist:
             error_message = u"""tag %s was not found. It is possible that the tag
 exists but we were not able to match it's unicode value
@@ -124,19 +135,24 @@ Also, you can try command "rename_tag_id"
 """ % tag_name
             raise CommandError(error_message)
         except models.Tag.MultipleObjectsReturned:
-            raise CommandError(u'found more than one tag named %s' % from_tag_name)
+            raise CommandError(u'found more than one tag named %s' % tag_name)
 
         admin = get_admin(seed_user_id = options['user_id'])
 
         to_tags = list()
         for tag_name in to_tag_names:
             try:
-                to_tags.append(models.Tag.objects.get(name = tag_name))
+                tag = models.Tag.objects.get(
+                                    name=tag_name,
+                                    language_code=options['lang']
+                                )
+                to_tags.append(tag)
             except models.Tag.DoesNotExist:
                 to_tags.append(
                     models.Tag.objects.create(
-                                name = tag_name,
-                                created_by = admin
+                                name=tag_name,
+                                created_by=admin,
+                                language_code=options['lang']
                     )
                 )
             except models.Tag.MultipleObjectsReturned:

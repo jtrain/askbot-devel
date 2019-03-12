@@ -4,37 +4,38 @@ import re
 import time
 import urllib
 from coffin import template as coffin_template
+from bs4 import BeautifulSoup
 from django.core import exceptions as django_exceptions
+from django.utils.encoding import force_unicode
 from django.utils.translation import ugettext as _
+from django.utils.translation import get_language as django_get_language
 from django.contrib.humanize.templatetags import humanize
 from django.template import defaultfilters
 from django.core.urlresolvers import reverse, resolve
 from django.http import Http404
+import simplejson
+from django.utils import timezone
+from django.utils.text import Truncator
 from askbot import exceptions as askbot_exceptions
 from askbot.conf import settings as askbot_settings
 from django.conf import settings as django_settings
 from askbot.skins import utils as skin_utils
+from askbot.utils.html import absolutize_urls, site_link
+from askbot.utils.html import site_url as site_url_func
+from askbot.utils import html as html_utils
 from askbot.utils import functions
 from askbot.utils import url_utils
+from askbot.utils.markup import markdown_input_converter
+from askbot.utils.markup import convert_text as _convert_text
 from askbot.utils.slug import slugify
-from askbot.shims.django_shims import ResolverMatch
+from askbot.utils.pluralization import py_pluralize as _py_pluralize
 
 from django_countries import countries
 from django_countries import settings as countries_settings
 
 register = coffin_template.Library()
 
-def absolutize_urls_func(text):
-    url_re1 = re.compile(r'(?P<prefix><img[^<]+src=)"(?P<url>/[^"]+)"', re.I)
-    url_re2 = re.compile(r"(?P<prefix><img[^<]+src=)'(?P<url>/[^']+)'", re.I)
-    url_re3 = re.compile(r'(?P<prefix><a[^<]+href=)"(?P<url>/[^"]+)"', re.I)
-    url_re4 = re.compile(r"(?P<prefix><a[^<]+href=)'(?P<url>/[^']+)'", re.I)
-    replacement = '\g<prefix>"%s\g<url>"' % askbot_settings.APP_URL
-    text = url_re1.sub(replacement, text)
-    text = url_re2.sub(replacement, text)
-    text = url_re3.sub(replacement, text)
-    return url_re4.sub(replacement, text)
-absolutize_urls = register.filter(absolutize_urls_func)
+absolutize_urls = register.filter(absolutize_urls)
 
 TIMEZONE_STR = pytz.timezone(
                     django_settings.TIME_ZONE
@@ -47,11 +48,50 @@ def add_tz_offset(datetime_object):
     return str(datetime_object) + ' ' + TIMEZONE_STR
 
 @register.filter
-def safe_urlquote(text, quote_plus = False):
+def as_js_bool(some_object):
+    if bool(some_object):
+        return 'true'
+    return 'false'
+
+@register.filter
+def as_json(data):
+    return simplejson.dumps(data)
+
+@register.filter
+def is_current_language(lang):
+    return lang == django_get_language()
+
+@register.filter
+def is_empty_editor_value(value):
+    if value == None:
+        return True
+    if str(value).strip() == '':
+        return True
+    #tinymce uses a weird sentinel placeholder
+    if askbot_settings.EDITOR_TYPE == 'tinymce':
+        soup = BeautifulSoup(value, 'html5lib')
+        return soup.getText().strip() == ''
+    return False
+
+@register.filter
+def to_int(value):
+    return int(value)
+
+@register.filter
+def safe_urlquote(text, quote_plus=False):
     if quote_plus:
         return urllib.quote_plus(text.encode('utf8'))
     else:
         return urllib.quote(text.encode('utf8'))
+
+@register.filter
+def show_block_to(block_name, user):
+    block = getattr(askbot_settings, block_name)
+    if block:
+        flag_name = block_name + '_ANON_ONLY'
+        require_anon = getattr(askbot_settings, flag_name, False)
+        return (require_anon is False) or user.is_anonymous()
+    return False
 
 @register.filter
 def strip_path(url):
@@ -59,10 +99,25 @@ def strip_path(url):
     return url_utils.strip_path(url)
 
 @register.filter
+def strip_tags(text):
+    """remove html tags"""
+    return html_utils.strip_tags(text)
+
+@register.filter
+def can_see_private_user_data(viewer, target):
+    if viewer.is_authenticated():
+        if viewer == target:
+            return True
+        if viewer.is_administrator_or_moderator():
+            #todo: take into account intersection of viewer and target user groups
+            return askbot_settings.SHOW_ADMINS_PRIVATE_USER_DATA
+    return False
+
+@register.filter
 def clean_login_url(url):
     """pass through, unless user was originally on the logout page"""
     try:
-        resolver_match = ResolverMatch(resolve(url))
+        resolver_match = resolve(url)
         from askbot.views.readers import question
         if resolver_match.func == question:
             return url
@@ -81,9 +136,18 @@ def transurl(url):
         raise ValueError(
             u'string %s is not good for url - must be ascii' % url
         )
-    if getattr(django_settings, 'ASKBOT_TRANSLATE_URL', False):
+    if django_settings.ASKBOT_TRANSLATE_URL:
         return urllib.quote(_(url).encode('utf-8'))
     return url
+
+@register.filter
+def truncate_html_post(post_html):
+    """truncates html if it is longer than 100 words"""
+    post_html = Truncator(post_html).words(5, truncate=' ...', html=True)
+    post_html = '<div class="truncated-post">' + post_html
+    post_html += '<span class="expander">(<a>' + _('more') + '</a>)</span>'
+    post_html += '<div class="clearfix"></div></div>'
+    return post_html
 
 @register.filter
 def country_display_name(country_code):
@@ -114,22 +178,31 @@ def get_age(birthday):
     return diff.days / 365
 
 @register.filter
-def media(url):
+def equal(one, other):
+    return one == other
+
+@register.filter
+def not_equal(one, other):
+    return one != other
+
+@register.filter
+def media(url, ignore_missing=False):
     """media filter - same as media tag, but
     to be used as a filter in jinja templates
     like so {{'/some/url.gif'|media}}
     """
     if url:
-        return skin_utils.get_media_url(url)
+        return skin_utils.get_media_url(url, ignore_missing)
     else:
         return ''
 
 @register.filter
 def fullmedia(url):
-    domain = askbot_settings.APP_URL
-    #protocol = getattr(settings, "PROTOCOL", "http")
-    path = media(url)
-    return "%s%s" % (domain, path)
+    return site_url_func(media(url))
+
+@register.filter
+def site_url(url):
+    return site_url_func(url)
 
 diff_date = register.filter(functions.diff_date)
 
@@ -196,9 +269,9 @@ def make_template_filter_from_permission_assertion(
     register.filter(filter_name, filter_function)
     return filter_function
 
-
 @register.filter
 def can_moderate_user(user, other_user):
+    """True, if user can moderate account of `other_user`"""
     if user.is_authenticated() and user.can_moderate_user(other_user):
         return True
     return False
@@ -277,7 +350,7 @@ def can_see_offensive_flags(user, post):
     suspended or blocked users cannot see flags
     """
     if user.is_authenticated():
-        if user == post.get_owner():
+        if user.pk == post.author_id:
             return True
         if user.reputation >= askbot_settings.MIN_REP_TO_VIEW_OFFENSIVE_FLAGS:
             return True
@@ -305,6 +378,10 @@ def humanize_counter(number):
     else:
         return str(number)
 
+@register.filter
+def py_pluralize(source, count):
+    plural_forms = source.strip().split('\n')
+    return _py_pluralize(plural_forms, count)
 
 @register.filter
 def absolute_value(number):
@@ -314,3 +391,34 @@ def absolute_value(number):
 def get_empty_search_state(unused):
     from askbot.search.state_manager import SearchState
     return SearchState.get_empty()
+
+@register.filter
+def sub_vars(text, user=None):
+    """replaces placeholders {{ USER_NAME }}
+    {{ SITE_NAME }}, {{ SITE_LINK }} with relevant values"""
+    sitename_re = re.compile(r'\{\{\s*SITE_NAME\s*\}\}')
+    sitelink_re = re.compile(r'\{\{\s*SITE_LINK\s*\}\}')
+
+    text = force_unicode(text)
+
+    if user:
+        if user.is_anonymous():
+            username = _('Visitor')
+        else:
+            username = user.username
+        username_re = re.compile(r'\{\{\s*USER_NAME\s*\}\}')
+        text = username_re.sub(username, text)
+
+    site_name = askbot_settings.APP_SHORT_NAME
+    text = sitename_re.sub(site_name, text)
+    text = sitelink_re.sub(site_link('index', site_name), text)
+    return text
+
+@register.filter
+def convert_markdown(text):
+    return markdown_input_converter(text)
+
+@register.filter
+def convert_text(text):
+    """converts text with the currently selected editor"""
+    return _convert_text(text)

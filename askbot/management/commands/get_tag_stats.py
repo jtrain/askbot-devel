@@ -1,5 +1,5 @@
+from __future__ import print_function
 import sys
-import optparse
 from django.core.management.base import BaseCommand, CommandError
 from askbot import models
 from askbot import const
@@ -47,43 +47,43 @@ def format_table_row(*cols, **kwargs):
 class Command(BaseCommand):
     help = 'Prints statistics of tag usage'
 
-    option_list = BaseCommand.option_list + (
-            optparse.make_option(
-                '-t',
-                '--sub-counts',
-                action = 'store_true',
-                default = False,
-                dest = 'sub_counts',
-                help = 'Print tag subscription statistics, for all tags, listed alphabetically'
-            ),
-            optparse.make_option(
-                '-u',
-                '--user-sub-counts',
-                action = 'store_true',
-                default = False,
-                dest = 'user_sub_counts',
-                help = 'Print tag subscription data per user, with users listed alphabetically'
-            ),
-            optparse.make_option(
-                '-e',
-                '--print-empty',
-                action = 'store_true',
-                default = False,
-                dest = 'print_empty',
-                help = 'Print empty records too (with zero counts)'
-            ),
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '-t',
+            '--sub-counts',
+            action='store_true',
+            default=False,
+            dest='sub_counts',
+            help='Print tag subscription statistics, for all tags, listed alphabetically'
         )
+        parser.add_argument(
+            '-u',
+            '--user-sub-counts',
+            action='store_true',
+            default=False,
+            dest='user_sub_counts',
+            help='Print tag subscription data per user, with users listed alphabetically'
+        )
+        parser.add_argument(
+            '-e',
+            '--print-empty',
+            action='store_true',
+            default=False,
+            dest='print_empty',
+            help='Print empty records too (with zero counts)'
+        )
+
     def handle(self, *args, **options):
         if not(options['sub_counts'] ^ options['user_sub_counts']):
             raise CommandError('Please use either -u or -t (but not both)')
 
-        print ''
+        print('')
         if options['sub_counts']:
             self.print_sub_counts(options['print_empty'])
 
         if options['user_sub_counts']:
             self.print_user_sub_counts(options['print_empty'])
-        print ''
+        print('')
 
     def print_user_sub_counts(self, print_empty):
         """prints list of users and what tags they follow/ignore
@@ -95,7 +95,7 @@ class Command(BaseCommand):
 
             #add names of explicitly followed tags
             followed_tags = list()
-            followed_tags.extend(   
+            followed_tags.extend(
                 tag_marks.filter(
                             reason='good'
                         ).values_list(
@@ -140,8 +140,8 @@ class Command(BaseCommand):
             if total_count == 0 and print_empty == False:
                 continue
             if item_count == 0:
-                print '%-28s %25s %25s %25s' % ('User (id)', 'Interesting tags', 'Ignored tags', 'Subscribed tags')
-                print '%-28s %25s %25s %25s' % ('=========', '================', '============', '===============')
+                print('%-28s %25s %25s %25s' % ('User (id)', 'Interesting tags', 'Ignored tags', 'Subscribed tags'))
+                print('%-28s %25s %25s %25s' % ('=========', '================', '============', '==============='))
             followed_lines = get_tag_lines(followed_tags, width = 25)
             ignored_lines = get_tag_lines(ignored_tags, width = 25)
             subscribed_lines = get_tag_lines(subscribed_tags, width = 25)
@@ -151,7 +151,7 @@ class Command(BaseCommand):
                 follow = ''
             user_string = '%s (%d)%s' % (user.username, user.id, follow)
             output_lines = format_table_row(
-                                [user_string,], 
+                                [user_string,],
                                 followed_lines,
                                 ignored_lines,
                                 subscribed_lines,
@@ -159,8 +159,8 @@ class Command(BaseCommand):
                             )
             item_count += 1
             for line in output_lines:
-                print line
-            print ''
+                print(line)
+            print('')
 
         self.print_postamble(item_count)
 
@@ -223,26 +223,26 @@ class Command(BaseCommand):
             follow_str = '%d (%d)' % (follow_count, wild_follow)
             ignore_str = '%d (%d)' % (ignore_count, wild_ignore)
             subscribe_str = '%d (%d)' % (subscribe_count, wild_sub)
-            counts = (11-len(subscribe_str)) * ' ' + subscribe_str + '  ' 
-            counts = (11-len(follow_str)) * ' ' + follow_str + '  ' 
+            counts = (11-len(subscribe_str)) * ' ' + subscribe_str + '  '
+            counts = (11-len(follow_str)) * ' ' + follow_str + '  '
             counts += (11-len(ignore_str)) * ' ' + ignore_str
 
             total_count = follow_count + ignore_count + subscribe_count
             if total_count == 0 and print_empty == False:
                 continue
             if item_count == 0:
-                print '%-32s %12s %12s %12s' % ('', 'Subscribed', 'Ignored  ', 'Interesting')
-                print '%-32s %12s %12s %12s' % ('Tag name', 'Total(wild)', 'Total(wild)', 'Total(wild)')
-                print '%-32s %12s %12s %12s' % ('========', '===========', '===========', '===========')
-            print '%-32s %s' % (tag.name, counts)
+                print('%-32s %12s %12s %12s' % ('', 'Subscribed', 'Ignored  ', 'Interesting'))
+                print('%-32s %12s %12s %12s' % ('Tag name', 'Total(wild)', 'Total(wild)', 'Total(wild)'))
+                print('%-32s %12s %12s %12s' % ('========', '===========', '===========', '==========='))
+            print('%-32s %s' % (tag.name, counts))
             item_count += 1
 
         self.print_postamble(item_count)
 
     def print_postamble(self, item_count):
-        print ''
+        print('')
         if item_count == 0:
-            print 'Did not find anything'
+            print('Did not find anything')
         else:
-            print '%d records shown' % item_count
-        print 'Since -e option was not selected, empty records were hidden'
+            print('%d records shown' % item_count)
+        print('Since -e option was not selected, empty records were hidden')
